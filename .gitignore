@@ -1,0 +1,79 @@
+# FreeBSD Kernel Module Build Artifacts
+*.ko
+*.kld
+*.o
+*.so
+
+# Dependency files
+.depend*
+*.depend
+
+# Auto-generated interface files
+device_if.h
+device_if.c
+bus_if.h
+bus_if.c
+pci_if.h
+pci_if.c
+ofw_bus_if.h
+ofw_bus_if.c
+opt_*.h
+
+# Machine architecture symlink
+machine
+
+# Export symbols file
+export_syms
+
+# Build directories
+.objdir/
+obj/
+
+# FreeBSD make temporary files
+.make.*
+
+# Backup files
+*~
+*.bak
+*.orig
+*.rej
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Core dumps
+core
+*.core
+
+# Test artifacts
+test.mk
+test_*.mk
+bsd-xargs
+
+# Compressed files (if you archive builds)
+*.tar
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# Debug symbols
+*.symbols
+
+# Temporary files
+tmp/
+temp/
+compile_commands.json
+
+.cache/
+scratch_notes.md
