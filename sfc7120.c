@@ -203,17 +203,31 @@ sfc7120_fbsd_probe(device_t dev)
 static int
 sfc7120_fbsd_attach(device_t dev)
 {
+	//finn: dev = opaque handle representing the PCI device instance (the solarflare). This gets us a pointer to a zero'd block of mem alloc'd by the kernel
+	//sc contains BAR handles, DMA buffers, ring pointers, MAC, CAPIO state
     sfc7120_softc_t *sc = device_get_softc(dev);
     int error;
-
+	
+    
     sc->dev = dev;
     sc->dying = false;
     sc->device_attached = false;
+    //finn: sc_mtx : main device lock, protects fields touched by multiple contexts. mutex taken by any thread that wants to use shared fields
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
 
     /* 1. Allocate BAR0 (function MMIO window). */
+    //finn: BAR = base address register. Tells system where in the phys addr space the device's registers live. 
+    //each BAR dewscribes either a range of MMIO space or a range of port I/O space 
+    //solarflare maybe exposes BAR0? we don't access it directly, have to get it through the bus
     sc->mem_res_id = PCIR_BAR(0);
+    //bus_alloc_resource_any:
+    // 1. reads BAR from PCI config space to find addr range
+    // 2. reserves the range so no other device can claim it
+    // 3. maps phys addr range into kernel virtual addr space (KVA) so CPU can reach it
+    // 4. returns a struct resource * wrapping the range
+    //
+    // anyway this is what's failing right now (finn wrote this 5/6 at 3:19PM)
     sc->mem_resource = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
         &sc->mem_res_id, RF_ACTIVE | RF_SHAREABLE);
     if (sc->mem_resource == NULL) {
