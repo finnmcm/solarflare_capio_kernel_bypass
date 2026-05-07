@@ -209,6 +209,9 @@ typedef struct sfc7120_softc {
     bool                mcdi_new_epoch;  /* next request starts a new epoch */
     bool                mcdi_initialized;
 
+    //finn: this is for failure preventions later
+    uint32_t mcdi_prev_reboot_status;
+
     /* DRV_ATTACH / ALLOC_VIS results, populated during hw_init. */
     uint32_t            mcdi_func_flags;  /* MC_CMD_DRV_ATTACH_EXT_OUT_FUNC_FLAGS */
     uint32_t            vi_base;          /* base absolute VI for this function */

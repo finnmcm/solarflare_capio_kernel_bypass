@@ -18,6 +18,127 @@ both as the work progresses.
 
 ---
 
+## Hardware Target
+
+**Card under test:** Solarflare **SFN7322F-R2** — Flareon Ultra Dual-Port
+10GbE PCIe 3.0 Server I/O Adapter (Precision Time edition).
+
+- Controller: **SFC9120** (Huntington, EF10 family)
+- Two physical 10GbE ports → two PFs (function 0 = port 0, function 1 = port 1)
+- Vendor / device IDs: `0x1924` / `0x0903` (PF), `0x1924` / `0x1903` (VF)
+- Subsystem: `0x1924:0x8007` (this is the "-R2 Precision Time" SKU)
+
+`pciconf -lvb` for the unit our driver attaches against (Function 1):
+
+```
+class=0x020000 rev=0x01 hdr=0x00
+vendor=0x1924 device=0x0903 subvendor=0x1924 subdevice=0x8007
+    vendor     = 'AMD Solarflare'
+    device     = 'SFC9120 10G Ethernet Controller'
+    cap 01[40] = powerspec 3  supports D0 D1 D2 D3  current D0
+    cap 05[50] = MSI supports 1 message, 64 bit
+    cap 10[70] = PCI-Express 2 endpoint max data 128(2048) FLR RO NS
+                 max read 512
+                 link x8(x8) speed 8.0(8.0) ASPM disabled(L0s/L1)
+    cap 11[b0] = MSI-X supports 32 messages
+                 Table in map 0x20[0x0], PBA in map 0x20[0x2000]
+    cap 03[d0] = VPD
+    ecap 0001[100] = AER 2 0 fatal 1 non-fatal 1 corrected
+    ecap 0003[140] = Serial 1 000f53ffff285490
+    ecap 000e[150] = ARI 1
+    ecap 0019[160] = PCIe Sec 1 lane errors 0
+    ecap 0010[180] = SR-IOV 1 IOV disabled, Memory Space disabled, ARI disabled
+                     0 VFs configured out of 0 supported
+                     First VF RID Offset 0x0001, VF RID Stride 0x0001
+                     VF Device ID 0x1903
+                     Page Sizes: 4096 (enabled), 8192, 65536, 262144, 1048576, 4194304
+    ecap 0017[1c0] = TPH Requester 1
+```
+
+Notable bits:
+- **FLR is supported** (cap 10) — `pcie_flr()` should work; we use it before
+  BAR alloc.
+- **MSI-X table lives in BAR4** (`map 0x20[0x0]`), so BAR4 is *not* the
+  function-control window. The 8 MB BAR (currently mapped via `PCIR_BAR(2)`)
+  is the candidate for the MMIO/MCDI doorbell window — but see "Open
+  question" below.
+- **Link is x8 / 8.0 GT/s** — full PCIe 3.0 negotiated, no degraded link.
+- **SR-IOV is present but disabled** — we attach as a regular PF.
+
+### Bringup notes (2026-05-07)
+
+**RESOLVED — FLR breaks this card.** Removing the `pcie_flr()` call at
+the top of `sfc7120_fbsd_attach` makes MMIO live immediately, MCDI
+responds, `MC_CMD_GET_VERSION` returns `1001.7.2.6`, `DRV_ATTACH`
+succeeds with `func_flags=0x6` (LINKCTRL+TRUSTED), and
+`GET_MAC_ADDRESSES` reads `00:0f:53:28:54:91`. Before the fix,
+`HW_REV_ID` and the entire 8 MB BAR returned all-zeros indefinitely — a
+host-driven FLR puts the SFN7322F-R2 into a state where the BIU clock
+domain stays gated, even after multi-second waits. **Stock sfxge does
+not FLR at attach; do not add it back without a different reset path
+(MC_CMD_REBOOT via MCDI, or per-VI soft reset).** The FLR call is
+currently `#if 0`'d out at the top of `sfc7120_fbsd_attach`.
+
+A second consequence: without FLR, firmware state survives module
+unload. If a previous load `DRV_ATTACH`'d and was unloaded without a
+matching `FREE_VIS`, the firmware still believes the previous driver
+owns those VIs, and `MC_CMD_ALLOC_VIS` returns `MC_CMD_ERR=95`
+(`EOPNOTSUPP` / errno 45). Fix: unconditionally issue
+`MC_CMD_FREE_VIS` before `MC_CMD_ALLOC_VIS` (sfxge does this — see
+`ef10_nic.c:2218-2220`). Already wired in `sfc7120_mcdi_alloc_vis`.
+
+Other small notes captured during bringup:
+- **`MC_DB_LWRD` (0x200) is write-only.** Reads return zero regardless of
+  what was written. The "LWRD probe" diagnostic in `sfc7120_mcdi_init`
+  reports "MMIO path dead" when in fact the register is write-only —
+  trust `HW_REV_ID` (0x000) for liveness, not LWRD.
+- **PF1 MAC differs from the serial number's last byte by 1.** The
+  pciconf serial reports the PF0 base MAC; PF1's MAC is base+1.
+
+### Earlier (now-resolved) symptom log
+
+Prior to disabling FLR, attach symptoms were:
+
+- BAR layout from `pciconf -lbv` (PF0 shown; PF1 is identical type/size,
+  shifted in address):
+
+  | RID | Offset | Type | Size | PF0 base | PF1 base |
+  |---|---|---|---|---|---|
+  | `PCIR_BAR(0)` | `0x10` | I/O | 256 B | `0x3100` | `0x3000` |
+  | `PCIR_BAR(2)` | `0x18` | mem64 | 8 MB | `0x60000000` | `0x60800000` |
+  | `PCIR_BAR(4)` | `0x20` | mem64 | 16 KB | `0x61000000` | `0x61004000` |
+
+  `PCIR_BAR(2)` (8 MB) is the function MMIO window — matches sfxge's
+  `EFX_MEM_BAR_HUNTINGTON_PF = 2`. `PCIR_BAR(4)` (16 KB) holds the MSI-X
+  table+PBA per the `cap 11` line of `pciconf`. So the BAR choice is
+  correct; "wrong BAR" is ruled out.
+- `PCIR_COMMAND` shows `MEMEN=1, BUSMASTER=1` both before and after the
+  failed command (so the device hasn't disabled itself mid-command).
+- Doorbell write order matches sfxge `ef10_mcdi_send_request` (high half
+  to LWRD at `0x200`, then low half to HWRD at `0x204` as the trigger).
+- The "doorbell-clear" init kick (HWRD ← 1) from `ef10_mcdi_init` is
+  performed.
+
+Remaining candidates:
+
+1. **Device not finished coming out of reset.** `pcie_flr()` returns at
+   1 s but Huntington's MC firmware can take several seconds to re-boot.
+   Until the BIU clock domain is fully up, MMIO reads return `0`. Fix:
+   after FLR, poll `HW_REV_ID` for up to ~5 s waiting for `0xeb14face`
+   before issuing any MCDI command.
+2. **CHERI `bus_space` capability bounds.** A scan over the first 4 KB
+   would distinguish this from (1): all-zeros = hardware-not-up;
+   `0xffffffff` past some offset = capability bounds issue.
+3. **Per-function init order.** Some EF10 firmware variants gate PF1
+   MMIO behind PF0 MCDI bringup. Worth ruling out by attaching to PF0
+   instead, or leaving stock `sfxge` on PF0 while we drive PF1.
+
+Next debug step is the BAR magic-value scan that's already wired into
+`sfc7120_mcdi_init` (uncommitted local change as of 2026-05-07) plus a
+post-FLR wait loop on `HW_REV_ID`.
+
+---
+
 ## Reference Reading (Required)
 
 Before modifying anything in this directory, read:

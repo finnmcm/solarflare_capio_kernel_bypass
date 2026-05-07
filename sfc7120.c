@@ -170,10 +170,6 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
 {
     int error;
 
-    error = sfc7120_pcie_flr(sc);
-    if (error != 0)
-        return error;
-
     error = sfc7120_mcdi_init(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: mcdi_init failed: %d\n", error);
@@ -271,6 +267,20 @@ sfc7120_fbsd_attach(device_t dev)
   sfxge_create vs sfxge_start.
   */
 
+//finn: moving the full reset to BEFORE the bus alloc that enables mem writes
+/* DEBUG: FLR disabled to test whether the host-driven FLR is what wedges
+ * MMIO on this -R2 PTP card. Stock sfxge does not FLR at attach. If reads
+ * start returning 0xeb14face with FLR off, the card is FLR-sensitive and
+ * we need a different reset path (MC_CMD_REBOOT via MCDI, or a soft reset
+ * through ER_DZ_BIU_INT_ISR_REG). */
+#if 0
+    error = sfc7120_pcie_flr(sc);
+    if(error != 0){
+	goto fail_bar; //placeholder cuz idrk where to fail
+	 }
+#else
+    device_printf(dev, "TRACE: FLR DISABLED for this attach attempt\n");
+#endif
 
     /* 1. Allocate BAR2 (function MMIO window). */
     device_printf(dev, "TRACE: about to alloc BAR2\n");

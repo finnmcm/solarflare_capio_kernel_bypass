@@ -49,6 +49,7 @@ __FBSDID("$FreeBSD$");
 #define EF10_REG_BIU_MC_SFT_STATUS      0x00000010  /* MC reboot status */
 #define EF10_REG_MC_DB_LWRD             0x00000200  /* doorbell pair, low offset  */
 #define EF10_REG_MC_DB_HWRD             0x00000204  /* doorbell pair, high offset */
+#define EF10_REG_BIU_HW_REV_ID_RESET    0xeb14faceu /* expected reset value */
 
 /* ---------------------------------------------------------------------- */
 /* MCDI v1 wire-format helpers.                                           */
@@ -239,6 +240,12 @@ sfc7120_mcdi_free_buf(sfc7120_softc_t *sc)
 
 /* ---------------------------------------------------------------------- */
 /* PCIe FLR.                                                               */
+/*                                                                         */
+/* Currently UNUSED — the call site in sfc7120_fbsd_attach is #if 0'd      */
+/* because a host-driven FLR puts the SFN7322F-R2 PTP-firmware variant     */
+/* into a state where the BIU clock domain stays gated indefinitely (every */
+/* MMIO read returns 0). Stock sfxge does not FLR at attach either. Kept   */
+/* as a placeholder for a future MCDI-driven reset path (MC_CMD_REBOOT).   */
 /* ---------------------------------------------------------------------- */
 
 int
@@ -246,13 +253,10 @@ sfc7120_pcie_flr(sfc7120_softc_t *sc)
 {
     /* 1 second cap matches what FreeBSD's pci(9) helpers use for FLR. The
      * `force` flag is false: if the device doesn't advertise FLR capability
-     * we don't try to fake it — the MC firmware will recover via its own
-     * watchdog if it was wedged. */
+     * we don't try to fake it. */
     if (!pcie_flr(sc->dev, 1000 * 1000, false)) {
         device_printf(sc->dev,
             "PCIe FLR not supported or failed; continuing\n");
-        /* Non-fatal: many EF10 firmware revisions can recover state via
-         * MCDI alone after a kldload/kldunload cycle. */
     }
     return 0;
 }
@@ -264,8 +268,10 @@ sfc7120_pcie_flr(sfc7120_softc_t *sc)
 int
 sfc7120_mcdi_init(sfc7120_softc_t *sc)
 {
-    int error;
+    int      error;
     uint32_t hw_rev;
+    uint32_t mc_sft_status;
+    uint16_t pci_cmd;
 
     KASSERT(!sc->mcdi_initialized, ("MCDI re-init"));
 
@@ -278,38 +284,54 @@ sfc7120_mcdi_init(sfc7120_softc_t *sc)
         return error;
     }
 
-    sc->mcdi_seq = 0;
-    sc->mcdi_new_epoch = true;
-
-    /* Sanity check — BAR0 register ID should read 0xeb14face on a healthy
-     * EF10. If we see all-ones here the function isn't actually mapped. */
-    hw_rev = SFC7120_READ_REG(sc, EF10_REG_BIU_HW_REV_ID);
-    device_printf(sc->dev, "MCDI: BIU_HW_REV_ID=%#x (expect 0xeb14face)\n",
-                  hw_rev);
-    if (hw_rev == 0xffffffff) {
-        device_printf(sc->dev, "MCDI: BAR read returned all-ones; aborting\n");
-        sfc7120_mcdi_free_buf(sc);
-        mtx_destroy(&sc->mcdi_mtx);
-        return ENXIO;
+    /* PCI memory decode + bus mastering must be on for both MMIO reads
+     * and the MC's DMA reads of the mailbox. attach() sets these up; this
+     * is defensive in case something downstream cleared them. */
+    pci_cmd = pci_read_config(sc->dev, PCIR_COMMAND, 2);
+    if ((pci_cmd & (PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN)) !=
+        (PCIM_CMD_MEMEN | PCIM_CMD_BUSMASTEREN)) {
+        device_printf(sc->dev,
+            "MCDI: PCIR_COMMAND=0x%04x missing MEMEN or BUSMASTER\n",
+            pci_cmd);
+        error = ENXIO;
+        goto fail;
     }
 
-    /*
-     * Snapshot the MC reboot status so subsequent commands can detect a
-     * reboot mid-bringup. We don't act on changes here — sfxge has the same
-     * behavior (see comments in ef10_mcdi_poll_reboot). The read is
-     * load-bearing only insofar as it primes the comparison value.
-     */
-    (void)SFC7120_READ_REG(sc, EF10_REG_BIU_MC_SFT_STATUS);
+    /* Liveness check. BIU_HW_REV_ID is hardwired to 0xeb14face on a healthy
+     * EF10. A read of 0 indicates the BIU clock domain is not up — the
+     * usual cause is a host-driven pcie_flr() which this card does not
+     * tolerate (see CLAUDE.md "Bringup notes"). 0xffffffff means the BAR
+     * isn't decoding at all. Either way no MCDI command will succeed. */
+    hw_rev = SFC7120_READ_REG(sc, EF10_REG_BIU_HW_REV_ID);
+    if (hw_rev != EF10_REG_BIU_HW_REV_ID_RESET) {
+        device_printf(sc->dev,
+            "MCDI: BIU_HW_REV_ID=0x%08x (expected 0x%08x); aborting\n",
+            hw_rev, EF10_REG_BIU_HW_REV_ID_RESET);
+        error = ENXIO;
+        goto fail;
+    }
 
-    /*
-     * Drive the MC doorbell HWRD half with a value of 1 to put it in a
-     * known state before posting our first request. Mirrors the "ensure MC
-     * doorbell is in a known state" sequence in ef10_mcdi_init().
-     */
+    /* Snapshot the MC soft status so callers can detect later MC reboots
+     * by re-reading and comparing against mcdi_prev_reboot_status. */
+    mc_sft_status = SFC7120_READ_REG(sc, EF10_REG_BIU_MC_SFT_STATUS);
+    device_printf(sc->dev, "MC soft status at attach: 0x%08x\n",
+                  mc_sft_status);
+
+    /* sfxge ef10_mcdi_init kicks HWRD with the literal value 1 before any
+     * commands so the MC's view of the doorbell is in a known state (see
+     * sfxge bug24769 recovery algorithm). */
     SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_HWRD, 1);
 
+    sc->mcdi_seq = 0;
+    sc->mcdi_new_epoch = true;
+    sc->mcdi_prev_reboot_status = mc_sft_status;
     sc->mcdi_initialized = true;
     return 0;
+
+fail:
+    sfc7120_mcdi_free_buf(sc);
+    mtx_destroy(&sc->mcdi_mtx);
+    return error;
 }
 
 void
@@ -354,16 +376,18 @@ sfc7120_mcdi_send_locked(sfc7120_softc_t *sc, uint32_t cmd,
                     BUS_DMASYNC_PREWRITE);
 
     /*
-     * Doorbell sequence as in ef10_mcdi_send_request(): write the high half
-     * of the mailbox physical address first (to the *_LWRD register), then
-     * the low half (to *_HWRD). The HWRD write is the trigger. Yes, the
-     * naming is unintuitive; the registers are named after their offsets
-     * in the doorbell pair, not the half of the address they receive.
+     * Post the mailbox physical address to the MC via the doorbell pair.
+     * Order matters: high half to MC_DB_LWRD first (no trigger), low half
+     * to MC_DB_HWRD second (this write is the trigger). The "LWRD"/"HWRD"
+     * names refer to the registers' offset in the doorbell pair, not the
+     * half of the address they receive. See ef10_mcdi.c:182-188.
      */
     paddr = (uint64_t)sc->mcdi_buf_paddr;
     SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_LWRD, (uint32_t)(paddr >> 32));
-    SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_HWRD, (uint32_t)(paddr & 0xffffffffu));
+    SFC7120_WRITE_REG(sc, EF10_REG_MC_DB_HWRD,
+                      (uint32_t)(paddr & 0xffffffffu));
 }
+
 
 static bool
 sfc7120_mcdi_poll_response(sfc7120_softc_t *sc)
@@ -435,9 +459,47 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     total_us = 0;
     while (!sfc7120_mcdi_poll_response(sc)) {
         if (total_us >= SFC7120_MCDI_TIMEOUT_US) {
-            SFC7120_MCDI_UNLOCK(sc);
+            uint32_t hdr_at_timeout, w1, w2, w3;
+            uint32_t hw_rev_now, mc_sft_now;
+            uint16_t pci_cmd_now;
+
+            /* Sync once more in case POSTREAD wasn't done at the moment
+             * the MC actually updated the mailbox. */
+            bus_dmamap_sync(sc->mcdi_dtag, sc->mcdi_dmamap,
+                            BUS_DMASYNC_POSTREAD);
+            hdr_at_timeout = mcdi_buf_read_dword(sc, 0);
+            w1 = mcdi_buf_read_dword(sc, 4);
+            w2 = mcdi_buf_read_dword(sc, 8);
+            w3 = mcdi_buf_read_dword(sc, 12);
+
+            /* Re-read identity / status registers to confirm the BAR is
+             * still alive and see whether the MC tripped over a reboot. */
+            hw_rev_now  = SFC7120_READ_REG(sc, EF10_REG_BIU_HW_REV_ID);
+            mc_sft_now  = SFC7120_READ_REG(sc, EF10_REG_BIU_MC_SFT_STATUS);
+            pci_cmd_now = pci_read_config(sc->dev, PCIR_COMMAND, 2);
+
             device_printf(sc->dev,
                 "MCDI cmd %#x timed out after %u us\n", cmd, total_us);
+            device_printf(sc->dev,
+                "  mailbox[0..15]: %08x %08x %08x %08x  (response_bit=%u)\n",
+                hdr_at_timeout, w1, w2, w3,
+                (hdr_at_timeout >> MCDI_HDR_RESPONSE_SHIFT) & 0x1u);
+            device_printf(sc->dev,
+                "  HW_REV_ID=0x%08x  MC_SFT_STATUS=0x%08x"
+                "  PCIR_COMMAND=0x%04x (MEMEN=%d BM=%d)\n",
+                hw_rev_now, mc_sft_now, pci_cmd_now,
+                (pci_cmd_now & PCIM_CMD_MEMEN)       ? 1 : 0,
+                (pci_cmd_now & PCIM_CMD_BUSMASTEREN) ? 1 : 0);
+            device_printf(sc->dev,
+                "  mcdi_buf_paddr=0x%lx seq=%u\n",
+                (unsigned long)sc->mcdi_buf_paddr, seq);
+
+            /* Advance epoch/seq even on timeout so the next command can
+             * try with a fresh seq number. */
+            sc->mcdi_new_epoch = false;
+            sc->mcdi_seq = (sc->mcdi_seq + 1) & MCDI_HDR_SEQ_MASK;
+
+            SFC7120_MCDI_UNLOCK(sc);
             return ETIMEDOUT;
         }
         DELAY(delay_us);
@@ -450,6 +512,15 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     /* Response is now in the mailbox. */
     header = mcdi_buf_read_dword(sc, 0);
     resp_datalen = (header >> MCDI_HDR_DATALEN_SHIFT) & MCDI_HDR_DATALEN_MASK;
+
+    uint8_t resp_seq = (header >> MCDI_HDR_SEQ_SHIFT) & MCDI_HDR_SEQ_MASK;
+    if (resp_seq != seq) {
+        device_printf(sc->dev,
+            "MCDI cmd %#x: seq mismatch (got %u, expected %u)\n",
+            cmd, resp_seq, seq);
+        rc = EPROTO;
+        goto out;
+    }
 
     if ((header >> MCDI_HDR_ERROR_SHIFT) & 0x1) {
         /* MC error: payload[0] is the MC_CMD_ERR_* code. */
@@ -492,23 +563,35 @@ out:
 int
 sfc7120_mcdi_get_version(sfc7120_softc_t *sc)
 {
+    //buffer to hold NIC response 
     uint8_t  resp[MC_CMD_GET_VERSION_OUT_LEN] = {0};
+    //nic writes this to say how many bytes were written to buffer
     size_t   used = 0;
     uint32_t v_lo, v_hi;
     int      rc;
 
+    //sfc7120_mcdi_exec is generic command sending function
+    //we send NULL 0 payload because get version takes no arguments
     rc = sfc7120_mcdi_exec(sc, MC_CMD_GET_VERSION,
                            NULL, 0, resp, sizeof(resp), &used);
     if (rc != 0)
         return rc;
+    //make sure we actually got enough bytes to read a version number
     if (used < MC_CMD_GET_VERSION_OUT_VERSION_OFST + 8) {
         device_printf(sc->dev,
             "MCDI GET_VERSION: short response (%zu bytes)\n", used);
         return EPROTO;
     }
 
-    memcpy(&v_lo, &resp[MC_CMD_GET_VERSION_OUT_VERSION_OFST + 0], 4);
-    memcpy(&v_hi, &resp[MC_CMD_GET_VERSION_OUT_VERSION_OFST + 4], 4);
+    uint32_t raw_lo, raw_hi;
+    //grab the lower 32 and upper 32 bits from the buffer and store them in our stack allocated values
+    memcpy(&raw_lo, &resp[MC_CMD_GET_VERSION_OUT_VERSION_OFST + 0], 4);
+    memcpy(&raw_hi, &resp[MC_CMD_GET_VERSION_OUT_VERSION_OFST + 4], 4);
+
+    //finn: added this - MCDI is little endian, just made it so that values are still correct on big endian host
+    v_lo = le32toh(raw_lo);
+    v_hi = le32toh(raw_hi);
+
     sc->fw_version[0] = v_lo;
     sc->fw_version[1] = v_hi;
     device_printf(sc->dev, "MC firmware version %u.%u.%u.%u\n",
@@ -618,6 +701,16 @@ sfc7120_mcdi_alloc_vis(sfc7120_softc_t *sc,
     uint8_t resp[MC_CMD_ALLOC_VIS_OUT_LEN] = {0};
     size_t  used = 0;
     int     rc;
+
+    /*
+     * Release any VIs left over from a previous attach. Without FLR the
+     * firmware retains the previous driver's VI ownership across module
+     * unload/reload and ALLOC_VIS then fails with MC_CMD_ERR=95
+     * (EOPNOTSUPP). Sfxge does the same unconditional FREE_VIS before
+     * ALLOC_VIS — see ef10_nic.c:2218-2220. If no VIs are owned the MC
+     * may return a benign error; that's expected on first load.
+     */
+    (void)sfc7120_mcdi_exec(sc, MC_CMD_FREE_VIS, NULL, 0, NULL, 0, NULL);
 
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MIN_OFST], &min_count, 4);
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MAX_OFST], &max_count, 4);
