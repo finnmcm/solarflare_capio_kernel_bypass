@@ -176,21 +176,21 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         device_printf(sc->dev, "hw_init: mcdi_init failed: %d\n", error);
         goto fail;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after mcdi_init");
+
 
     error = sfc7120_mcdi_get_version(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: GET_VERSION failed: %d\n", error);
         goto fail_mcdi;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after GET_VERSION");
+
 
     error = sfc7120_mcdi_drv_attach(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: DRV_ATTACH failed: %d\n", error);
         goto fail_mcdi;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after DRV_ATTACH");
+
 
     /* Drain/clear any pending MC firmware assertion. Mirrors sfxge
      * ef10_nic.c:1981-1991. */
@@ -200,7 +200,6 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
             "hw_init: clear_assertions failed: %d\n", error);
         goto fail_mcdi;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after GET_ASSERTS");
 
     /* Per-function resource reset. Releases any VIs / queues / filters
      * still tied to this PCI function from a previous load that didn't
@@ -213,7 +212,7 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
             "hw_init: ENTITY_RESET failed: %d\n", error);
         goto fail_attach;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after ENTITY_RESET");
+
 
     error = sfc7120_mcdi_get_mac(sc);
     if (error != 0) {
@@ -221,15 +220,6 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
             "hw_init: GET_MAC_ADDRESSES failed: %d\n", error);
         goto fail_attach;
     }
-    sfc7120_mcdi_log_mc_state(sc, "after GET_MAC");
-
-    /* Diagnostic: dump GET_PORT_ASSIGNMENT / GET_FUNCTION_INFO /
-     * GET_CAPABILITIES so we can see what the firmware thinks of this
-     * function before ALLOC_VIS. ALLOC_VIS=ENOENT typically means the
-     * function has no VI bank — that's most often caused by missing port
-     * binding or an unexpected datapath firmware variant. */
-    (void)sfc7120_mcdi_dump_func_info(sc);
-    sfc7120_mcdi_log_mc_state(sc, "after GET_*INFO dump");
 
     /* min=1, max=32. Sfxge defaults to MIN(128, MAX(rxq_limit,txq_limit))
      * (ef10_nic.c:2003-2004). Some firmware variants reject a max=1 request
@@ -240,8 +230,7 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         device_printf(sc->dev, "hw_init: ALLOC_VIS failed: %d\n", error);
         sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS fail");
         goto fail_attach;
-    }
-    sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS");
+    } 
 
     return 0;
 
@@ -299,28 +288,6 @@ sfc7120_fbsd_attach(device_t dev)
     //finn: sc_mtx : main device lock, protects fields touched by multiple contexts. mutex taken by any thread that wants to use shared fields
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
-
-/* 
- *   The current attach order (sfc7120.c:241,250) is BAR → hw_init → alloc_dma_resources. That can't work as-is, because steps 7–10 below require DMA-allocated rings. Two clean options:
-
-  - (A) Split: keep hw_init for MCDI bringup + identity queries; introduce a new sfc7120_hw_start(sc) after alloc_dma_resources that runs the queue-init commands. This mirrors sfxge's
-  sfxge_create vs sfxge_start.
-  */
-
-//finn: moving the full reset to BEFORE the bus alloc that enables mem writes
-/* DEBUG: FLR disabled to test whether the host-driven FLR is what wedges
- * MMIO on this -R2 PTP card. Stock sfxge does not FLR at attach. If reads
- * start returning 0xeb14face with FLR off, the card is FLR-sensitive and
- * we need a different reset path (MC_CMD_REBOOT via MCDI, or a soft reset
- * through ER_DZ_BIU_INT_ISR_REG). */
-#if 0
-    error = sfc7120_pcie_flr(sc);
-    if(error != 0){
-	goto fail_bar; //placeholder cuz idrk where to fail
-	 }
-#else
-    device_printf(dev, "TRACE: FLR DISABLED for this attach attempt\n");
-#endif
 
     /* 1. Allocate BAR2 (function MMIO window). */
     device_printf(dev, "TRACE: about to alloc BAR2\n");
