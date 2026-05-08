@@ -710,7 +710,9 @@ sfc7120_mcdi_alloc_vis(sfc7120_softc_t *sc,
      * ALLOC_VIS — see ef10_nic.c:2218-2220. If no VIs are owned the MC
      * may return a benign error; that's expected on first load.
      */
-    (void)sfc7120_mcdi_exec(sc, MC_CMD_FREE_VIS, NULL, 0, NULL, 0, NULL);
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_FREE_VIS, NULL, 0, NULL, 0, NULL);
+    device_printf(sc->dev, "MC_CMD_FREE_VIS returned: %d\n", rc);
 
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MIN_OFST], &min_count, 4);
     memcpy(&in[MC_CMD_ALLOC_VIS_IN_MAX_OFST], &max_count, 4);
