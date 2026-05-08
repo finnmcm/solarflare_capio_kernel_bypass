@@ -132,30 +132,164 @@ sfc7120_is_dying(void *void_sc)
 }
 
 /* ---------------------------------------------------------------------- */
-/* DMA helpers — TODO: implement EVQ/TXQ/RXQ ring + buffer allocations.   */
-/*                                                                        */
-/* The e1000 driver has working bus_dma_tag_create / bus_dmamem_alloc /   */
-/* bus_dmamap_load chains for TX and RX in e1000_alloc_tx_dma() and       */
-/* e1000_alloc_rx_dma(). The mlx5pol driver wraps the same calls in a     */
-/* single mlx5_alloc_dmabuf() helper; that pattern is preferable for any  */
-/* driver with more than two DMA buffers (sfc7120 has at least three:     */
-/* EVQ, TX desc ring, RX desc ring, plus packet buffers).                 */
+/* DMA helpers                                                            */
 /* ---------------------------------------------------------------------- */
+
+static void
+sfc7120_dma_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
+{
+    bus_addr_t *out = arg;
+    *out = (error != 0 || nseg < 1) ? 0 : segs[0].ds_addr;
+}
+
+/* Allocate one DMA-coherent buffer: tag → alloc → load → return paddr.
+ * On failure, cleans up whatever it managed to allocate and returns errno. */
+static int
+sfc7120_alloc_dmabuf(device_t dev,
+                     bus_dma_tag_t *dtag, bus_dmamap_t *dmamap,
+                     void **vaddr, bus_addr_t *paddr,
+                     bus_size_t size, bus_size_t align,
+                     const char *name)
+{
+    int error;
+
+    error = bus_dma_tag_create(bus_get_dma_tag(dev),
+                               align, 0,
+                               BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR,
+                               NULL, NULL,
+                               size, 1, size,
+                               0, NULL, NULL, dtag);
+    if (error != 0) {
+        device_printf(dev, "%s: bus_dma_tag_create failed: %d\n", name, error);
+        return error;
+    }
+  //arthur:  stores virtual addresses that we can actually use for the buffers using a freebsd macro, in the softc
+    error = bus_dmamem_alloc(*dtag, vaddr,
+                             BUS_DMA_WAITOK | BUS_DMA_COHERENT | BUS_DMA_ZERO,
+                             dmamap);
+    if (error != 0) {
+        device_printf(dev, "%s: bus_dmamem_alloc failed: %d\n", name, error);
+        bus_dma_tag_destroy(*dtag);
+        *dtag = NULL;
+        return error;
+    }
+
+    *paddr = 0;
+      // arthur: this does a translation from the virtual addresses to physical ones the NIC can DMA to/from
+    error = bus_dmamap_load(*dtag, *dmamap, *vaddr, size,
+                            sfc7120_dma_cb, paddr, BUS_DMA_NOWAIT);
+    if (error != 0 || *paddr == 0) {
+        device_printf(dev, "%s: bus_dmamap_load failed: %d\n", name, error);
+        bus_dmamem_free(*dtag, *vaddr, *dmamap);
+        bus_dma_tag_destroy(*dtag);
+        *vaddr = NULL;
+        *dtag  = NULL;
+        return (error != 0) ? error : ENOMEM;
+    }
+
+    device_printf(dev, "DMA alloc: %-16s  vaddr=%p  paddr=0x%lx  size=0x%lx\n",
+                  name, *vaddr, (unsigned long)*paddr, (unsigned long)size);
+    return 0;
+}
+
+static void
+sfc7120_free_dmabuf(bus_dma_tag_t *dtag, bus_dmamap_t *dmamap,
+                    void **vaddr, bus_addr_t *paddr)
+{
+    if (*paddr != 0) {
+        bus_dmamap_unload(*dtag, *dmamap);
+        *paddr = 0;
+    }
+    if (*vaddr != NULL) {
+        bus_dmamem_free(*dtag, *vaddr, *dmamap);
+        *vaddr = NULL;
+    }
+    if (*dtag != NULL) {
+        bus_dma_tag_destroy(*dtag);
+        *dtag = NULL;
+    }
+}
 
 static int
 sfc7120_alloc_dma_resources(sfc7120_softc_t *sc)
 {
-    /* TODO: allocate evq_ring, tx_desc_ring, rx_desc_ring, tx_buffer,
-     * rx_buffer. Mirror e1000_alloc_tx_dma / e1000_alloc_rx_dma. */
-    (void)sc;
+    int        error;
+    bus_size_t evq_size = SFC7120_NUM_EVQ_ENTRY * SFC7120_EVQ_ENTRY_SIZE;
+    bus_size_t txd_size = SFC7120_NUM_TX_DESC   * SFC7120_TX_DESC_SIZE;
+    bus_size_t rxd_size = SFC7120_NUM_RX_DESC   * SFC7120_RX_DESC_SIZE;
+    bus_size_t txb_size = SFC7120_NUM_TX_DESC   * SFC7120_TX_BUFFER_SIZE;
+    bus_size_t rxb_size = SFC7120_NUM_RX_DESC   * SFC7120_RX_BUFFER_SIZE;
+
+    /* EVQ ring: NIC DMA-writes 64-bit events here. 4KB aligned (EF10 req). */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->evq_dtag, &sc->evq_dmamap,
+                                 &sc->evq_ring, &sc->evq_ring_paddr,
+                                 evq_size, 4096, "EVQ ring");
+    if (error != 0)
+        return error;
+
+    /* TX descriptor ring: driver writes outgoing packet descriptors here. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->tx_desc_dtag, &sc->tx_desc_dmamap,
+                                 &sc->tx_desc_ring, &sc->tx_desc_ring_paddr,
+                                 txd_size, 4096, "TX desc ring");
+    if (error != 0)
+        goto fail_evq;
+
+    /* RX descriptor ring: driver writes free buffer addresses here. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->rx_desc_dtag, &sc->rx_desc_dmamap,
+                                 &sc->rx_desc_ring, &sc->rx_desc_ring_paddr,
+                                 rxd_size, 4096, "RX desc ring");
+    if (error != 0)
+        goto fail_txd;
+
+    /* TX packet buffer: 128KB region userspace mmaps to write TX packets. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->tx_buffer_dtag, &sc->tx_buffer_dmamap,
+                                 &sc->tx_buffer, &sc->tx_buffer_paddr,
+                                 txb_size, PAGE_SIZE, "TX buffer");
+    if (error != 0)
+        goto fail_rxd;
+
+    /* RX packet buffer: 128KB region NIC DMAs received packets into. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->rx_buffer_dtag, &sc->rx_buffer_dmamap,
+                                 &sc->rx_buffer, &sc->rx_buffer_paddr,
+                                 rxb_size, PAGE_SIZE, "RX buffer");
+    if (error != 0)
+        goto fail_txb;
+
     return 0;
+
+fail_txb:
+    sfc7120_free_dmabuf(&sc->tx_buffer_dtag, &sc->tx_buffer_dmamap,
+                        &sc->tx_buffer, &sc->tx_buffer_paddr);
+fail_rxd:
+    sfc7120_free_dmabuf(&sc->rx_desc_dtag, &sc->rx_desc_dmamap,
+                        &sc->rx_desc_ring, &sc->rx_desc_ring_paddr);
+fail_txd:
+    sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
+                        &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+fail_evq:
+    sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
+                        &sc->evq_ring, &sc->evq_ring_paddr);
+    return error;
 }
 
 static void
 sfc7120_free_dma_resources(sfc7120_softc_t *sc)
 {
-    /* TODO: free what alloc allocated. */
-    (void)sc;
+    sfc7120_free_dmabuf(&sc->rx_buffer_dtag, &sc->rx_buffer_dmamap,
+                        &sc->rx_buffer, &sc->rx_buffer_paddr);
+    sfc7120_free_dmabuf(&sc->tx_buffer_dtag, &sc->tx_buffer_dmamap,
+                        &sc->tx_buffer, &sc->tx_buffer_paddr);
+    sfc7120_free_dmabuf(&sc->rx_desc_dtag, &sc->rx_desc_dmamap,
+                        &sc->rx_desc_ring, &sc->rx_desc_ring_paddr);
+    sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
+                        &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+    sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
+                        &sc->evq_ring, &sc->evq_ring_paddr);
 }
 
 /* ---------------------------------------------------------------------- */
