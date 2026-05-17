@@ -55,7 +55,7 @@
 
 #define SFC7120_NUM_TX_DESC    64
 #define SFC7120_NUM_RX_DESC    64
-#define SFC7120_NUM_EVQ_ENTRY  256
+#define SFC7120_NUM_EVQ_ENTRY  512
 #define SFC7120_TX_BUFFER_SIZE 2048
 #define SFC7120_RX_BUFFER_SIZE 2048
 
@@ -221,6 +221,7 @@ typedef struct sfc7120_softc {
     uint32_t            fw_version[2];    /* hi/lo pair */
     bool                drv_attached;
     bool                vis_allocated;
+    bool                evq_initialized;
 
     bool                debug_reg_ops;
 } sfc7120_softc_t;

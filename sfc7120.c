@@ -228,6 +228,13 @@ sfc7120_alloc_dma_resources(sfc7120_softc_t *sc)
     if (error != 0)
         return error;
 
+    /* Prime ring to 0xff. EF10 events use bit 63 as the "valid" marker; an
+     * all-1s ring lets the driver tell "no event yet" from "stale event
+     * with garbage payload" when polling. PREWRITE sync flushes the CPU
+     * caches so the NIC sees the pattern before it starts producing. */
+    memset(sc->evq_ring, 0xff, evq_size);
+    bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap, BUS_DMASYNC_PREWRITE);
+
     /* TX descriptor ring: driver writes outgoing packet descriptors here. */
     error = sfc7120_alloc_dmabuf(sc->dev,
                                  &sc->tx_desc_dtag, &sc->tx_desc_dmamap,
@@ -457,6 +464,14 @@ sfc7120_fbsd_attach(device_t dev)
         goto fail_hw;
     }
     device_printf(dev, "TRACE: alloc_dma_resources done\n");
+
+    /* INITIALIZING EVENT QUEUE */
+    device_printf(dev, "TRACE: calling init_evq\n");
+    error = sfc7120_mcdi_init_evq(sc, sc->vi_base, sc->evq_ring_paddr, SFC7120_NUM_EVQ_ENTRY);
+    if (error != 0) {
+        device_printf(dev, "init_evq failed: %d\n", error);
+        goto fail_dma;
+    }
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */

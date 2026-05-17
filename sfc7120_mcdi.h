@@ -70,5 +70,6 @@ int  sfc7120_mcdi_get_mac(sfc7120_softc_t *sc);
 int  sfc7120_mcdi_alloc_vis(sfc7120_softc_t *sc,
                             uint32_t min_count, uint32_t max_count);
 int  sfc7120_mcdi_free_vis(sfc7120_softc_t *sc);
+int  sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance, bus_addr_t ring_paddr, size_t nevs);
 
 #endif /* SFC7120_MCDI_H */

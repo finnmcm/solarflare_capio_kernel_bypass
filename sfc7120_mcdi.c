@@ -144,6 +144,21 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_GET_FUNCTION_INFO_OUT_PF_OFST 0
 #define MC_CMD_GET_FUNCTION_INFO_OUT_VF_OFST 4
 
+//init evq
+#define MC_CMD_INIT_EVQ                   0x80
+  #define MC_CMD_INIT_EVQ_IN_LEN(num)       (36 + 8 * (num))
+  #define MC_CMD_INIT_EVQ_IN_SIZE_OFST      0
+  #define MC_CMD_INIT_EVQ_IN_INSTANCE_OFST  4
+  #define MC_CMD_INIT_EVQ_IN_TMR_LOAD_OFST  8
+  #define MC_CMD_INIT_EVQ_IN_TMR_RELOAD_OFST 12
+  #define MC_CMD_INIT_EVQ_IN_FLAGS_OFST     16
+  #define MC_CMD_INIT_EVQ_IN_TMR_MODE_OFST  20
+  #define MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST 24
+  #define MC_CMD_INIT_EVQ_IN_COUNT_MODE_OFST 28
+  #define MC_CMD_INIT_EVQ_IN_COUNT_THRSHLD_OFST 32
+  #define MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST  36
+  #define MC_CMD_INIT_EVQ_OUT_LEN           4
+
 #define MC_CMD_GET_CAPABILITIES           0xbe
 #define MC_CMD_GET_CAPABILITIES_OUT_LEN   20
 #define MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST 0
@@ -999,6 +1014,71 @@ sfc7120_mcdi_drv_detach(sfc7120_softc_t *sc)
     return rc;
 }
 
+int
+sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
+                      bus_addr_t paddr, size_t nevs)
+{
+    /* nevs constraints: power-of-two in [512, 32768], ring fills whole
+     * 4K pages. The (nevs * 8) % 4096 check is implied by pow2 + >= 512
+     * but kept as belt-and-suspenders. */
+    if (nevs < 512 || nevs > 32768 ||
+        (nevs & (nevs - 1)) != 0 ||
+        ((nevs * 8) % 4096) != 0) {
+        device_printf(sc->dev,
+            "MCDI INIT_EVQ: bad nevs=%zu\n", nevs);
+        return EINVAL;
+    }
+    if (instance < sc->vi_base ||
+        instance >= sc->vi_base + sc->vi_count) {
+        device_printf(sc->dev,
+            "MCDI INIT_EVQ: instance %u outside [%u, %u)\n",
+            instance, sc->vi_base, sc->vi_base + sc->vi_count);
+        return EINVAL;
+    }
+
+    size_t npages = (nevs * SFC7120_EVQ_ENTRY_SIZE) / 4096;
+
+    /* Only one DMA page supported today (nevs == 512 → npages == 1).
+     * Grow the fixed buffer + the bus_addr_t store loop below when this
+     * is relaxed. MCDI permits up to 64 DMA addresses (MAXNUM = 64). */
+    KASSERT(npages == 1,
+        ("sfc7120 INIT_EVQ: npages=%zu not supported yet", npages));
+
+    /* Huntington requires RX_MERGE and TX_MERGE to be set together — the
+     * firmware EINVALs the request otherwise even when the datapath fw
+     * doesn't actually batch RX events. CUT_THRU is set because this card
+     * has the LOW_LATENCY datapath fw variant (GET_CAPABILITIES reports
+     * rxdp_fw_id=0x0001, txdp_fw_id=0x0001). See sfxge ef10_ev.c:185-205
+     * for the canonical encoding. Bits: CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
+    const uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
+
+    uint8_t buf[MC_CMD_INIT_EVQ_IN_LEN(1)] = {0};
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_SIZE_OFST)     = nevs;
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_INSTANCE_OFST) = instance;
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_FLAGS_OFST)    = flags;
+    *(uint64_t *)(buf + MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST) = paddr;
+
+    /* OUT carries the IRQ number when FLAG_INTERRUPTING is set; we don't
+     * set it yet (MSI-X not wired). Allocate and zero it anyway so exec
+     * has a non-NULL response sink. */
+    uint32_t out = 0;
+    size_t   out_used = 0;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_INIT_EVQ,
+                               buf, MC_CMD_INIT_EVQ_IN_LEN(npages),
+                               &out, sizeof(out), &out_used);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI INIT_EVQ failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->evq_read_ptr    = 0;
+    sc->evq_initialized = true;
+    device_printf(sc->dev,
+        "MC INIT_EVQ: instance=%u nevs=%zu paddr=%#jx\n",
+        instance, nevs, (uintmax_t)paddr);
+    return 0;
+}
 int
 sfc7120_mcdi_get_mac(sfc7120_softc_t *sc)
 {
