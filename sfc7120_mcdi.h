@@ -71,5 +71,16 @@ int  sfc7120_mcdi_alloc_vis(sfc7120_softc_t *sc,
                             uint32_t min_count, uint32_t max_count);
 int  sfc7120_mcdi_free_vis(sfc7120_softc_t *sc);
 int  sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance, bus_addr_t ring_paddr, size_t nevs);
+int  sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance);
+
+/* vAdaptor + TXQ/RXQ helpers */
+int sfc7120_mcdi_vadaptor_alloc(sfc7120_softc_t *sc);
+int sfc7120_mcdi_vadaptor_free(sfc7120_softc_t *sc);
+
+int sfc7120_mcdi_init_rxq(sfc7120_softc_t *sc, uint32_t instance, uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs);
+int sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance, uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs);
+
+int sfc7120_mcdi_fini_rxq(sfc7120_softc_t *sc, uint32_t instance);
+int sfc7120_mcdi_fini_txq(sfc7120_softc_t *sc, uint32_t instance);
 
 #endif /* SFC7120_MCDI_H */

@@ -159,6 +159,60 @@ __FBSDID("$FreeBSD$");
   #define MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST  36
   #define MC_CMD_INIT_EVQ_OUT_LEN           4
 
+//init tx/rx
+#define EVB_PORT_ID_ASSIGNED              0x01000000  /* sfxge uses this — required */
+  #define MC_CMD_INIT_RXQ                   0x81
+  #define MC_CMD_INIT_RXQ_IN_LEN(npages)    (28 + 8 * (npages))
+  #define MC_CMD_INIT_RXQ_IN_SIZE_OFST       0
+  #define MC_CMD_INIT_RXQ_IN_TARGET_EVQ_OFST 4
+  #define MC_CMD_INIT_RXQ_IN_LABEL_OFST      8
+  #define MC_CMD_INIT_RXQ_IN_INSTANCE_OFST  12
+  #define MC_CMD_INIT_RXQ_IN_FLAGS_OFST     16
+  #define MC_CMD_INIT_RXQ_IN_OWNER_ID_OFST  20
+  #define MC_CMD_INIT_RXQ_IN_PORT_ID_OFST   24
+  #define MC_CMD_INIT_RXQ_IN_DMA_ADDR_OFST  28
+  #define MC_CMD_INIT_RXQ_OUT_LEN            0
+
+  #define MC_CMD_INIT_TXQ                   0x82
+  #define MC_CMD_INIT_TXQ_IN_LEN(npages)    (28 + 8 * (npages))
+  #define MC_CMD_INIT_TXQ_IN_SIZE_OFST       0
+  #define MC_CMD_INIT_TXQ_IN_TARGET_EVQ_OFST 4
+  #define MC_CMD_INIT_TXQ_IN_LABEL_OFST      8
+  #define MC_CMD_INIT_TXQ_IN_INSTANCE_OFST  12
+  #define MC_CMD_INIT_TXQ_IN_FLAGS_OFST     16
+  #define MC_CMD_INIT_TXQ_IN_OWNER_ID_OFST  20
+  #define MC_CMD_INIT_TXQ_IN_PORT_ID_OFST   24
+  #define MC_CMD_INIT_TXQ_IN_DMA_ADDR_OFST  28
+  #define MC_CMD_INIT_TXQ_OUT_LEN            0
+
+  #define MC_CMD_FINI_RXQ                   0x84
+  #define MC_CMD_FINI_RXQ_IN_LEN             4
+  #define MC_CMD_FINI_RXQ_IN_INSTANCE_OFST   0
+  #define MC_CMD_FINI_RXQ_OUT_LEN            0
+
+  #define MC_CMD_FINI_TXQ                   0x85
+  #define MC_CMD_FINI_TXQ_IN_LEN             4
+  #define MC_CMD_FINI_TXQ_IN_INSTANCE_OFST   0
+  #define MC_CMD_FINI_TXQ_OUT_LEN            0
+
+  #define MC_CMD_FINI_EVQ                   0x83
+  #define MC_CMD_FINI_EVQ_IN_LEN             4
+  #define MC_CMD_FINI_EVQ_IN_INSTANCE_OFST   0
+  #define MC_CMD_FINI_EVQ_OUT_LEN            0
+
+#define MC_CMD_VADAPTOR_ALLOC                          0x98
+#define MC_CMD_VADAPTOR_FREE                           0x99
+
+#define MC_CMD_VADAPTOR_ALLOC_IN_LEN                   30
+#define MC_CMD_VADAPTOR_ALLOC_IN_UPSTREAM_PORT_ID_OFST  0
+#define MC_CMD_VADAPTOR_ALLOC_IN_FLAGS_OFST             8
+#define MC_CMD_VADAPTOR_ALLOC_IN_MACADDR_OFST           24
+#define MC_CMD_VADAPTOR_ALLOC_OUT_LEN                   0
+
+#define MC_CMD_VADAPTOR_FREE_IN_LEN                     4
+#define MC_CMD_VADAPTOR_FREE_IN_UPSTREAM_PORT_ID_OFST   0
+#define MC_CMD_VADAPTOR_FREE_OUT_LEN                    0
+
 #define MC_CMD_GET_CAPABILITIES           0xbe
 #define MC_CMD_GET_CAPABILITIES_OUT_LEN   20
 #define MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST 0
@@ -548,8 +602,16 @@ sfc7120_mcdi_exec(sfc7120_softc_t *sc, uint32_t cmd,
     if (in_len > MCDI_PAYLOAD_LEN_MAX_V1 ||
         out_len > MCDI_PAYLOAD_LEN_MAX_V1)
         return EINVAL;
-    if ((in_len & 3) != 0)
-        return EINVAL;
+    /* NOTE: in_len does NOT need to be dword-aligned. The v1 datalen field
+     * and the v2 ext-header ACTUAL_LEN field are both byte counts, and
+     * MC_CMD_VADAPTOR_ALLOC_IN_LEN=30 (UPSTREAM_PORT_ID 4 + gap 4 + FLAGS 4
+     * + NUM_VLANS 4 + NUM_VLAN_TAGS 4 + VLAN_TAGS 4 + MACADDR 6) is one
+     * such command. mcdi_buf_write_payload() pads the trailing partial
+     * dword with zeros, which is what the MC firmware expects. A previous
+     * `(in_len & 3) != 0 → EINVAL` precheck here silently rejected every
+     * VADAPTOR_ALLOC attempt before it ever reached the MC — manifesting
+     * as rc=22 with no "MCDI cmd 0x98 failed" log line. Do not add it
+     * back. */
 
     SFC7120_MCDI_LOCK(sc);
 
@@ -834,6 +896,8 @@ sfc7120_mcdi_dump_func_info(sfc7120_softc_t *sc)
                &resp[MC_CMD_GET_CAPABILITIES_OUT_HW_CAPS_OFST], 4);
         memcpy(&lic_caps,
                &resp[MC_CMD_GET_CAPABILITIES_OUT_LICENSE_CAPS_OFST], 4);
+        sc->mcdi_cap_flags1 = flags1;
+        sc->mcdi_caps_valid = true;
         device_printf(sc->dev,
             "MC GET_CAPABILITIES: flags1=0x%08x rxdp_fw=0x%04x "
             "txdp_fw=0x%04x hw_caps=0x%08x lic_caps=0x%08x\n",
@@ -1028,11 +1092,16 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
             "MCDI INIT_EVQ: bad nevs=%zu\n", nevs);
         return EINVAL;
     }
-    if (instance < sc->vi_base ||
-        instance >= sc->vi_base + sc->vi_count) {
+    /* INSTANCE is the function-local queue index (0..vi_count-1), NOT the
+     * absolute VI number from ALLOC_VIS. The MCDI header comment for
+     * INIT_EVQ_IN_INSTANCE says "function local queue index"; sfxge's
+     * ef10_ev_qcreate (ef10_ev.c:480-484) likewise checks
+     * `index >= enc_evq_limit` where enc_evq_limit is the per-function
+     * VI count. */
+    if (instance >= sc->vi_count) {
         device_printf(sc->dev,
-            "MCDI INIT_EVQ: instance %u outside [%u, %u)\n",
-            instance, sc->vi_base, sc->vi_base + sc->vi_count);
+            "MCDI INIT_EVQ: instance %u outside [0, %u)\n",
+            instance, sc->vi_count);
         return EINVAL;
     }
 
@@ -1044,19 +1113,44 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
     KASSERT(npages == 1,
         ("sfc7120 INIT_EVQ: npages=%zu not supported yet", npages));
 
-    /* Huntington requires RX_MERGE and TX_MERGE to be set together — the
-     * firmware EINVALs the request otherwise even when the datapath fw
-     * doesn't actually batch RX events. CUT_THRU is set because this card
-     * has the LOW_LATENCY datapath fw variant (GET_CAPABILITIES reports
-     * rxdp_fw_id=0x0001, txdp_fw_id=0x0001). See sfxge ef10_ev.c:185-205
-     * for the canonical encoding. Bits: CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
-    const uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
+    /* Huntington firmware quirks (see sfxge ef10_ev.c:185-205 / 499-507):
+     *   - RX_MERGE and TX_MERGE must be set together. The PTP/low-latency
+     *     datapath fw EINVALs if only one is set, even though the variant
+     *     doesn't actually batch RX events.
+     *   - CUT_THRU is set because this card reports
+     *     rxdp_fw_id=0x0001 / txdp_fw_id=0x0001 (RXDP_LOW_LATENCY).
+     *   - The first EVQ (function-local index 0) MUST be interrupting.
+     *     sfxge unconditionally forces INTERRUPTING=1 for index 0. We
+     *     haven't allocated MSI-X yet, but the firmware accepts the
+     *     command as long as the flag is set; nothing will actually fire
+     *     into a vector until we wire up bus_setup_intr later.
+     * Bits: INTERRUPTING=0, CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
+    uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
+    if (instance == 0)
+        flags |= (1u << 0);
 
     uint8_t buf[MC_CMD_INIT_EVQ_IN_LEN(1)] = {0};
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_SIZE_OFST)     = nevs;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_INSTANCE_OFST) = instance;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_FLAGS_OFST)    = flags;
+    /* IRQ_NUM (offset 24, unioned with TARGET_EVQ): function-relative
+     * vector for interrupting EVQs. For index 0 with INTERRUPTING set,
+     * sfxge writes irq=index (i.e. 0); we mirror that. */
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST) = instance;
     *(uint64_t *)(buf + MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST) = paddr;
+
+    device_printf(sc->dev,
+      "INIT_EVQ wire (44B): "
+      "SIZE=%u INSTANCE=%u FLAGS=%#x TMR_MODE=%u COUNT_MODE=%u "
+      "DMA_LO=%#x DMA_HI=%#x paddr=%#jx align=%#jx\n",
+      *(uint32_t *)(buf + 0),
+      *(uint32_t *)(buf + 4),
+      *(uint32_t *)(buf + 16),
+      *(uint32_t *)(buf + 20),
+      *(uint32_t *)(buf + 28),
+      *(uint32_t *)(buf + 36),
+      *(uint32_t *)(buf + 40),
+      (uintmax_t)paddr, (uintmax_t)(paddr & 0xfff));
 
     /* OUT carries the IRQ number when FLAG_INTERRUPTING is set; we don't
      * set it yet (MSI-X not wired). Allocate and zero it anyway so exec
@@ -1079,6 +1173,286 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
         instance, nevs, (uintmax_t)paddr);
     return 0;
 }
+int
+sfc7120_mcdi_init_rxq(sfc7120_softc_t *sc, uint32_t instance,
+                      uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs)
+{
+    /* ndescs constraints: power-of-two, ring fills whole 4K pages. Minimum
+     * 512 entries because the firmware requires at least one 4K page; the
+     * (ndescs * 8) % 4096 == 0 check is implied by pow2 + >= 512 but kept
+     * as belt-and-suspenders. */
+    if (ndescs < 512 || ndescs > 4096 ||
+        (ndescs & (ndescs - 1)) != 0 ||
+        ((ndescs * 8) % 4096) != 0) {
+        device_printf(sc->dev,
+            "MCDI INIT_RXQ: bad ndescs=%zu\n", ndescs);
+        return EINVAL;
+    }
+    if (!sc->vadaptor_allocated) {
+        device_printf(sc->dev,
+            "MCDI INIT_RXQ: vAdaptor not allocated — call vadaptor_alloc first\n");
+        return EINVAL;
+    }
+    /* INSTANCE and TARGET_EVQ are function-local queue indices (0..vi_count-1),
+     * NOT absolute VI numbers from ALLOC_VIS. */
+    if (instance >= sc->vi_count) {
+        device_printf(sc->dev,
+            "MCDI INIT_RXQ: instance %u outside [0, %u)\n",
+            instance, sc->vi_count);
+        return EINVAL;
+    }
+    if (target_evq >= sc->vi_count) {
+        device_printf(sc->dev,
+            "MCDI INIT_RXQ: target_evq %u outside [0, %u)\n",
+            target_evq, sc->vi_count);
+        return EINVAL;
+    }
+
+    size_t npages = (ndescs * 8) / 4096;
+
+    /* Only one DMA page supported today (ndescs == 512 → npages == 1).
+     * Grow the fixed buffer + the bus_addr_t store loop below when this
+     * is relaxed. MCDI permits up to 28 DMA addresses for legacy _IN. */
+    KASSERT(npages == 1,
+        ("sfc7120 INIT_RXQ: npages=%zu not supported yet", npages));
+
+    /* Flag encoding (legacy _IN):
+     *   FLAG_BUFF_MODE (bit 0)         = 0  — physical mode (no buftbl)
+     *   FLAG_PREFIX    (bit 8)         = 1  — per-packet RX prefix on EF10
+     *   FLAG_DISABLE_SCATTER (bit 9)   = 1  — one packet per descriptor
+     * All other bits (HDR_SPLIT, TIMESTAMP, CRC_MODE, CHAIN) left 0. */
+    uint32_t flags = (1u << 8) | (1u << 9);
+
+    uint8_t buf[MC_CMD_INIT_RXQ_IN_LEN(1)] = {0};
+    *(uint32_t *)(buf + MC_CMD_INIT_RXQ_IN_SIZE_OFST)       = ndescs;
+    *(uint32_t *)(buf + MC_CMD_INIT_RXQ_IN_TARGET_EVQ_OFST) = target_evq;
+    *(uint32_t *)(buf + MC_CMD_INIT_RXQ_IN_INSTANCE_OFST)   = instance;
+    *(uint32_t *)(buf + MC_CMD_INIT_RXQ_IN_FLAGS_OFST)      = flags;
+    *(uint32_t *)(buf + MC_CMD_INIT_RXQ_IN_PORT_ID_OFST)    = EVB_PORT_ID_ASSIGNED;
+    *(uint64_t *)(buf + MC_CMD_INIT_RXQ_IN_DMA_ADDR_OFST)   = ring_paddr;
+
+    device_printf(sc->dev,
+      "INIT_RXQ wire (36B): "
+      "SIZE=%u TARGET_EVQ=%u LABEL=%u INSTANCE=%u FLAGS=%#x "
+      "OWNER_ID=%u PORT_ID=%#x DMA_LO=%#x DMA_HI=%#x paddr=%#jx align=%#jx\n",
+      *(uint32_t *)(buf + 0),
+      *(uint32_t *)(buf + 4),
+      *(uint32_t *)(buf + 8),
+      *(uint32_t *)(buf + 12),
+      *(uint32_t *)(buf + 16),
+      *(uint32_t *)(buf + 20),
+      *(uint32_t *)(buf + 24),
+      *(uint32_t *)(buf + 28),
+      *(uint32_t *)(buf + 32),
+      (uintmax_t)ring_paddr, (uintmax_t)(ring_paddr & 0xfff));
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_INIT_RXQ,
+                               buf, MC_CMD_INIT_RXQ_IN_LEN(npages),
+                               NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI INIT_RXQ failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->rxq_initialized = true;
+    device_printf(sc->dev,
+        "MC INIT_RXQ: instance=%u target_evq=%u ndescs=%zu paddr=%#jx\n",
+        instance, target_evq, ndescs, (uintmax_t)ring_paddr);
+    return 0;
+}
+
+int
+sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance,
+                      uint32_t target_evq, bus_addr_t ring_paddr, size_t ndescs)
+{
+    if (ndescs < 512 || ndescs > 4096 ||
+        (ndescs & (ndescs - 1)) != 0 ||
+        ((ndescs * 8) % 4096) != 0) {
+        device_printf(sc->dev,
+            "MCDI INIT_TXQ: bad ndescs=%zu\n", ndescs);
+        return EINVAL;
+    }
+    if (!sc->vadaptor_allocated) {
+        device_printf(sc->dev,
+            "MCDI INIT_TXQ: vAdaptor not allocated — call vadaptor_alloc first\n");
+        return EINVAL;
+    }
+    if (instance >= sc->vi_count) {
+        device_printf(sc->dev,
+            "MCDI INIT_TXQ: instance %u outside [0, %u)\n",
+            instance, sc->vi_count);
+        return EINVAL;
+    }
+    if (target_evq >= sc->vi_count) {
+        device_printf(sc->dev,
+            "MCDI INIT_TXQ: target_evq %u outside [0, %u)\n",
+            target_evq, sc->vi_count);
+        return EINVAL;
+    }
+
+    size_t npages = (ndescs * 8) / 4096;
+    KASSERT(npages == 1,
+        ("sfc7120 INIT_TXQ: npages=%zu not supported yet", npages));
+
+    /* Flag encoding (legacy _IN). WATCH OUT: csum flags are *DISABLE*-polarity
+     * (opposite of RXQ's FLAG_PREFIX), so setting bit 1/2 turns offload OFF.
+     *   FLAG_BUFF_MODE       (bit 0) = 0 — physical mode
+     *   FLAG_IP_CSUM_DIS     (bit 1) = 1 — disable IPv4 csum offload
+     *   FLAG_TCP_CSUM_DIS    (bit 2) = 1 — disable TCP/UDP csum offload
+     * All other bits (TCP_UDP_ONLY, CRC_MODE, TIMESTAMP, PACER_BYPASS,
+     * INNER_*_CSUM_EN) left 0. */
+    uint32_t flags = (1u << 1) | (1u << 2);
+
+    uint8_t buf[MC_CMD_INIT_TXQ_IN_LEN(1)] = {0};
+    *(uint32_t *)(buf + MC_CMD_INIT_TXQ_IN_SIZE_OFST)       = ndescs;
+    *(uint32_t *)(buf + MC_CMD_INIT_TXQ_IN_TARGET_EVQ_OFST) = target_evq;
+    *(uint32_t *)(buf + MC_CMD_INIT_TXQ_IN_INSTANCE_OFST)   = instance;
+    *(uint32_t *)(buf + MC_CMD_INIT_TXQ_IN_FLAGS_OFST)      = flags;
+    *(uint32_t *)(buf + MC_CMD_INIT_TXQ_IN_PORT_ID_OFST)    = EVB_PORT_ID_ASSIGNED;
+    *(uint64_t *)(buf + MC_CMD_INIT_TXQ_IN_DMA_ADDR_OFST)   = ring_paddr;
+
+    device_printf(sc->dev,
+      "INIT_TXQ wire (36B): "
+      "SIZE=%u TARGET_EVQ=%u LABEL=%u INSTANCE=%u FLAGS=%#x "
+      "OWNER_ID=%u PORT_ID=%#x DMA_LO=%#x DMA_HI=%#x paddr=%#jx align=%#jx\n",
+      *(uint32_t *)(buf + 0),
+      *(uint32_t *)(buf + 4),
+      *(uint32_t *)(buf + 8),
+      *(uint32_t *)(buf + 12),
+      *(uint32_t *)(buf + 16),
+      *(uint32_t *)(buf + 20),
+      *(uint32_t *)(buf + 24),
+      *(uint32_t *)(buf + 28),
+      *(uint32_t *)(buf + 32),
+      (uintmax_t)ring_paddr, (uintmax_t)(ring_paddr & 0xfff));
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_INIT_TXQ,
+                               buf, MC_CMD_INIT_TXQ_IN_LEN(npages),
+                               NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI INIT_TXQ failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->txq_initialized = true;
+    device_printf(sc->dev,
+        "MC INIT_TXQ: instance=%u target_evq=%u ndescs=%zu paddr=%#jx\n",
+        instance, target_evq, ndescs, (uintmax_t)ring_paddr);
+    return 0;
+}
+
+int
+sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance)
+{
+    if (!sc->evq_initialized)
+        return 0;
+
+    uint8_t buf[MC_CMD_FINI_EVQ_IN_LEN] = {0};
+    *(uint32_t *)(buf + MC_CMD_FINI_EVQ_IN_INSTANCE_OFST) = instance;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_FINI_EVQ,
+                               buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FINI_EVQ failed: %d\n", rc);
+        /* EBUSY here means RXQ/TXQ still point at us — caller invoked FINI
+         * in the wrong order. Flag stays set so the caller can retry. */
+        if (rc == EBUSY)
+            return rc;
+    }
+    sc->evq_initialized = false;
+    return rc;
+}
+
+int
+sfc7120_mcdi_fini_rxq(sfc7120_softc_t *sc, uint32_t instance)
+{
+    if (!sc->rxq_initialized)
+        return 0;
+
+    uint8_t buf[MC_CMD_FINI_RXQ_IN_LEN] = {0};
+    *(uint32_t *)(buf + MC_CMD_FINI_RXQ_IN_INSTANCE_OFST) = instance;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_FINI_RXQ,
+                               buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FINI_RXQ failed: %d\n", rc);
+        /* Clear the flag anyway — repeating FINI is unsafe and on MC
+         * reboot the firmware has already forgotten the queue. */
+    }
+    sc->rxq_initialized = false;
+    return rc;
+}
+
+int
+sfc7120_mcdi_fini_txq(sfc7120_softc_t *sc, uint32_t instance)
+{
+    if (!sc->txq_initialized)
+        return 0;
+
+    uint8_t buf[MC_CMD_FINI_TXQ_IN_LEN] = {0};
+    *(uint32_t *)(buf + MC_CMD_FINI_TXQ_IN_INSTANCE_OFST) = instance;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_FINI_TXQ,
+                               buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FINI_TXQ failed: %d\n", rc);
+    }
+    sc->txq_initialized = false;
+    return rc;
+}
+
+int
+sfc7120_mcdi_vadaptor_alloc(sfc7120_softc_t *sc)
+{
+    if (sc->vadaptor_allocated)
+        return 0;
+
+    uint8_t  buf[MC_CMD_VADAPTOR_ALLOC_IN_LEN] = {0};
+    uint32_t flags = 0;
+
+    /* PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED is at LBN 1; sfxge sets it iff
+     * GET_CAPABILITIES FLAGS1 bit 11 is advertised. MAC field stays zero
+     * (AUTO_MAC) — the MC derives the MAC from the upstream port. */
+    if (sc->mcdi_caps_valid && (sc->mcdi_cap_flags1 & (1u << 11)) != 0)
+        flags |= (1u << 1);
+
+    *(uint32_t *)(buf + MC_CMD_VADAPTOR_ALLOC_IN_UPSTREAM_PORT_ID_OFST) =
+        EVB_PORT_ID_ASSIGNED;
+    *(uint32_t *)(buf + MC_CMD_VADAPTOR_ALLOC_IN_FLAGS_OFST) = flags;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_VADAPTOR_ALLOC,
+                               buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI VADAPTOR_ALLOC failed: %d\n", rc);
+        return rc;
+    }
+
+    sc->vadaptor_allocated = true;
+    device_printf(sc->dev,
+        "MC VADAPTOR_ALLOC: upstream_port=%#x ok (flags=0x%x)\n",
+        EVB_PORT_ID_ASSIGNED, flags);
+    return 0;
+}
+
+int
+sfc7120_mcdi_vadaptor_free(sfc7120_softc_t *sc)
+{
+    if (!sc->vadaptor_allocated)
+        return 0;
+
+    uint8_t buf[MC_CMD_VADAPTOR_FREE_IN_LEN] = {0};
+    *(uint32_t *)(buf + MC_CMD_VADAPTOR_FREE_IN_UPSTREAM_PORT_ID_OFST) =
+        EVB_PORT_ID_ASSIGNED;
+
+    int rc = sfc7120_mcdi_exec(sc, MC_CMD_VADAPTOR_FREE,
+                               buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI VADAPTOR_FREE failed: %d\n", rc);
+    }
+    sc->vadaptor_allocated = false;
+    return rc;
+}
+
 int
 sfc7120_mcdi_get_mac(sfc7120_softc_t *sc)
 {

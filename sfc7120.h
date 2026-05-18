@@ -53,8 +53,11 @@
  * be added later by extending the region enum and softc.
  */
 
-#define SFC7120_NUM_TX_DESC    64
-#define SFC7120_NUM_RX_DESC    64
+/* EF10 requires each descriptor ring to be at least one full 4K page. With
+ * 8-byte descriptors that's 512 entries minimum — anything smaller makes
+ * INIT_RXQ/INIT_TXQ EINVAL. */
+#define SFC7120_NUM_TX_DESC    512
+#define SFC7120_NUM_RX_DESC    512
 #define SFC7120_NUM_EVQ_ENTRY  512
 #define SFC7120_TX_BUFFER_SIZE 2048
 #define SFC7120_RX_BUFFER_SIZE 2048
@@ -217,11 +220,23 @@ typedef struct sfc7120_softc {
     uint32_t            vi_base;          /* base absolute VI for this function */
     uint32_t            vi_count;         /* VIs allocated to this function */
 
+    /* GET_CAPABILITIES FLAGS1 cache. Populated by sfc7120_mcdi_dump_func_info.
+     * Used downstream to gate optional MCDI flags (e.g. the PERMIT_SET_MAC_*
+     * bit in VADAPTOR_ALLOC) that older firmware variants reject with EINVAL
+     * when the cap isn't advertised. Mirrors sfxge's enc_* capability cache.*/
+    uint32_t            mcdi_cap_flags1;
+    bool                mcdi_caps_valid;
+
     /* GET_VERSION result (firmware build identifier). */
     uint32_t            fw_version[2];    /* hi/lo pair */
     bool                drv_attached;
     bool                vis_allocated;
     bool                evq_initialized;
+
+    /* vadaptor, tx/rx init flags */
+    bool vadaptor_allocated;
+    bool rxq_initialized;
+    bool txq_initialized;
 
     bool                debug_reg_ops;
 } sfc7120_softc_t;

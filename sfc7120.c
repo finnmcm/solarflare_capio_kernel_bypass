@@ -362,6 +362,12 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
+    /* Pull GET_CAPABILITIES (plus PORT_ASSIGNMENT / FUNCTION_INFO) so the
+     * cap_flags1 cache is populated before any later command that needs to
+     * gate optional flag bits on advertised capabilities (e.g. the PERMIT_
+     * SET_MAC_* bit in VADAPTOR_ALLOC). Non-fatal — it only logs. */
+    (void)sfc7120_mcdi_dump_func_info(sc);
+
     /* min=1, max=32. Sfxge defaults to MIN(128, MAX(rxq_limit,txq_limit))
      * (ef10_nic.c:2003-2004). Some firmware variants reject a max=1 request
      * outright; widening the range lets the MC pick a number it's willing
@@ -371,7 +377,16 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         device_printf(sc->dev, "hw_init: ALLOC_VIS failed: %d\n", error);
         sfc7120_mcdi_log_mc_state(sc, "after ALLOC_VIS fail");
         goto fail_attach;
-    } 
+    }
+
+    /* Allocate the vAdaptor on the function's auto-assigned upstream port.
+     * Without this, INIT_RXQ / INIT_TXQ will reject our PORT_ID. */
+    error = sfc7120_mcdi_vadaptor_alloc(sc);
+    if (error != 0) {
+        device_printf(sc->dev, "hw_init: VADAPTOR_ALLOC failed: %d\n", error);
+        sfc7120_mcdi_log_mc_state(sc, "after VADAPTOR_ALLOC fail");
+        goto fail_attach;
+    }
 
     return 0;
 
@@ -386,9 +401,17 @@ fail:
 static void
 sfc7120_hw_teardown(sfc7120_softc_t *sc)
 {
-    /* Reverse of hw_init. Each helper is a no-op if the corresponding
-     * stage never ran, so it's safe to call from partial-attach failure
-     * paths. */
+    /* Reverse of hw_init + the queue inits done in attach. Each helper is a
+     * no-op if the corresponding stage never ran, so it's safe to call from
+     * partial-attach failure paths.
+     *
+     * Order matters: FINI_TXQ / FINI_RXQ must complete before FINI_EVQ
+     * (firmware returns EBUSY otherwise — RX/TX queues hold a reference to
+     * their target EVQ). VADAPTOR_FREE must happen before FREE_VIS. */
+    (void)sfc7120_mcdi_fini_txq(sc, 0);
+    (void)sfc7120_mcdi_fini_rxq(sc, 0);
+    (void)sfc7120_mcdi_fini_evq(sc, 0);
+    (void)sfc7120_mcdi_vadaptor_free(sc);
     (void)sfc7120_mcdi_free_vis(sc);
     (void)sfc7120_mcdi_drv_detach(sc);
     sfc7120_mcdi_fini(sc);
@@ -467,11 +490,38 @@ sfc7120_fbsd_attach(device_t dev)
 
     /* INITIALIZING EVENT QUEUE */
     device_printf(dev, "TRACE: calling init_evq\n");
-    error = sfc7120_mcdi_init_evq(sc, sc->vi_base, sc->evq_ring_paddr, SFC7120_NUM_EVQ_ENTRY);
+    /* INSTANCE is the *function-local* queue index, not the absolute VI
+     * number (ALLOC_VIS-returned vi_base). EF10 firmware additionally
+     * requires the first EVQ (function-local 0) to be interrupting —
+     * init_evq sets the INTERRUPTING flag and IRQ_NUM=0 accordingly. */
+    error = sfc7120_mcdi_init_evq(sc, 0, sc->evq_ring_paddr, SFC7120_NUM_EVQ_ENTRY);
     if (error != 0) {
         device_printf(dev, "init_evq failed: %d\n", error);
         goto fail_dma;
     }
+    device_printf(dev, "TRACE: init_evq done\n");
+
+    /* INITIALIZING RX QUEUE. instance and target_evq are function-local
+     * indices (0..vi_count-1), matching EVQ instance 0 above. */
+    device_printf(dev, "TRACE: calling init_rxq\n");
+    error = sfc7120_mcdi_init_rxq(sc, 0, 0, sc->rx_desc_ring_paddr,
+                                  SFC7120_NUM_RX_DESC);
+    if (error != 0) {
+        device_printf(dev, "init_rxq failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: init_rxq done\n");
+
+    /* INITIALIZING TX QUEUE */
+    device_printf(dev, "TRACE: calling init_txq\n");
+    error = sfc7120_mcdi_init_txq(sc, 0, 0, sc->tx_desc_ring_paddr,
+                                  SFC7120_NUM_TX_DESC);
+    if (error != 0) {
+        device_printf(dev, "init_txq failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: init_txq done\n");
+
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */
@@ -538,7 +588,12 @@ sfc7120_fbsd_attach(device_t dev)
     return 0;
 
 fail_dma:
+    /* FINI the queues (inside hw_teardown) BEFORE freeing the DMA rings the
+     * firmware is writing into — otherwise the NIC keeps DMAing into freed
+     * memory. Can't fall through to fail_hw or we'd call hw_teardown twice. */
+    sfc7120_hw_teardown(sc);
     sfc7120_free_dma_resources(sc);
+    goto fail_bar;
 fail_hw:
     sfc7120_hw_teardown(sc);
 fail_bar:
@@ -578,8 +633,11 @@ sfc7120_fbsd_detach(device_t dev)
         sc->cdev = NULL;
     }
 
-    sfc7120_free_dma_resources(sc);
+    /* Firmware teardown (FINI_TXQ/RXQ/EVQ, VADAPTOR_FREE, FREE_VIS, ...)
+     * MUST happen before freeing the DMA rings — otherwise the NIC keeps
+     * DMA-writing events/completions into freed memory. */
     sfc7120_hw_teardown(sc);
+    sfc7120_free_dma_resources(sc);
 
     if (sc->mem_resource != NULL) {
         bus_release_resource(dev, SYS_RES_MEMORY, sc->mem_res_id,

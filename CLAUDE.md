@@ -6,19 +6,24 @@ Out-of-tree workspace for the Solarflare SFN7000-series (Huntington / EF10)
 CAPIO kernel driver stub. Modeled on `~/CheriBsdE1000/`: cross-compile via
 bmake on Linux, native make on CheriBSD, output `sfc7120pol.ko`.
 
-**Status: ATTACHES CLEANLY (as of 2026-05-08).** The PCI driver, CAPIO
-wiring, IOCTL dispatch, slice manifest, MCDI transport (v1 + v2 framing),
-identity bringup (`GET_VERSION` / `DRV_ATTACH` / `GET_MAC` /
-`GET_PORT_ASSIGNMENT` / `GET_FUNCTION_INFO` / `GET_CAPABILITIES`), per-
-function reset (`ENTITY_RESET`), assertion clearing (`GET_ASSERTS`), and
-VI allocation (`ALLOC_VIS` — currently 32 VIs starting at base 1024) are
-all working. The DMA mailbox allocation, cdev creation, smem population,
-and `init_capio_sc` succeed end-to-end; `dmesg` ends with `sfc7120pol
+**Status: ATTACHES CLEANLY WITH QUEUES INITIALIZED (as of 2026-05-18).**
+The PCI driver, CAPIO wiring, IOCTL dispatch, slice manifest, MCDI
+transport (v1 + v2 framing), identity bringup (`GET_VERSION` /
+`DRV_ATTACH` / `GET_MAC` / `GET_PORT_ASSIGNMENT` / `GET_FUNCTION_INFO` /
+`GET_CAPABILITIES`), per-function reset (`ENTITY_RESET`), assertion
+clearing (`GET_ASSERTS`), VI allocation (`ALLOC_VIS` — 32 VIs at base
+1024 on PF1, base 1 on PF0), vAdaptor allocation
+(`VADAPTOR_ALLOC` on `EVB_PORT_ID_ASSIGNED` with `PERMIT_SET_MAC_*`
+cap-gated), and per-queue init (`INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` —
+512 descriptors each, all targeting EVQ 0) all succeed. The DMA mailbox,
+DMA rings + packet buffers, cdev creation, smem population, and
+`init_capio_sc` complete end-to-end; both PF0 and PF1 reach `sfc7120pol
 attached`.
 
-Still **TODO**: per-queue init (`INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ`),
-MAC reconfiguration, MSI-X interrupt handler, TX/RX IOCTL bodies, in-tree
-copy at `~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
+Still **TODO**: MAC reconfiguration + link bring-up
+(`MC_CMD_SET_MAC` / `MC_CMD_SET_LINK`), MSI-X interrupt handler + EVQ
+event walking, TX/RX IOCTL bodies, in-tree copy at
+`~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
 `~/E1000Lwip/netif/sfc7120_driver.c`.
 
 ---
@@ -149,6 +154,49 @@ for v1, 8 for v2) so `sfc7120_mcdi_exec` can read the response from
 the right location. The exec wrapper also pulls `resp_datalen` from
 the v2 ext header when v2 was used. See "MCDI Implementation" below.
 
+### Bringup notes (2026-05-18) — **The MCDI byte-length alignment trap**
+
+**RESOLVED — `VADAPTOR_ALLOC` + queue init (`INIT_EVQ` / `INIT_RXQ` /
+`INIT_TXQ`) now work after removing an over-strict alignment check in
+`sfc7120_mcdi_exec`.** Several days of `MC_CMD_VADAPTOR_ALLOC` (opcode
+`0x98`) returning `rc=22` across every argument permutation (cap-gated
+vs zero flags, AUTO_MAC vs explicit MAC) traced to:
+
+```c
+/* sfc7120_mcdi_exec — DO NOT add this back */
+if ((in_len & 3) != 0)
+    return EINVAL;
+```
+
+`MC_CMD_VADAPTOR_ALLOC_IN_LEN = 30` (UPSTREAM_PORT_ID 4 + gap 4 +
+FLAGS 4 + NUM_VLANS 4 + NUM_VLAN_TAGS 4 + VLAN_TAGS 4 + **MACADDR 6**)
+is not a multiple of 4. The pre-flight check silently rejected every
+attempt **before the request ever reached the MC**. The MCDI v1
+`datalen` field and v2 ACTUAL_LEN field are byte counts, not dword
+counts — the firmware accepts arbitrary byte lengths, and
+`mcdi_buf_write_payload` already zero-pads the trailing partial dword.
+
+The diagnostic smoking gun: the failure had **no** `MCDI cmd 0x98
+failed: MC_CMD_ERR=...` log line. That line is only emitted on the
+header-error path inside `sfc7120_mcdi_exec`; its absence means the
+rejection happened *inside* exec, not on the wire. Compare to
+`VADAPTOR_QUERY` failures from the same debug session, which did
+produce the log line (`MCDI cmd 0x61 failed: MC_CMD_ERR=4097` —
+`NO_VADAPTOR`).
+
+**Lesson:** when a translated errno appears at a call site but no
+corresponding MC-error log line shows up, the failure is in your
+exec/encode path, not in the firmware. Check the early-return paths
+(initialization, size bounds, alignment) before debugging firmware
+behavior. A long debug detour into privilege masks, EVB capabilities,
+and four-variant payload probes diagnosed the wrong layer — the actual
+fix was a one-line deletion.
+
+The current `sfc7120_mcdi_vadaptor_alloc` is a single-call wrapper
+matching sfxge's `efx_mcdi_vadaptor_alloc` exactly: cap-gated
+`PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED` flag, AUTO_MAC, no preemptive
+FREE.
+
 ### Firmware variant (this card)
 
 `MC_CMD_GET_CAPABILITIES` on PF1 reports:
@@ -158,9 +206,12 @@ the v2 ext header when v2 was used. See "MCDI Implementation" below.
 
 This is the **low-latency datapath firmware variant**, *not* the
 "full-featured" variant. Consistent with the SFN7322F-R2 being the
-"Precision Time" SKU. Some MCDI features (notably parts of TSO,
-RSS-mode extensions) are gated behind `FULL_FEATURED`; we don't need
-them now but keep this in mind once we get to per-queue setup.
+"Precision Time" SKU. Per-queue init (`INIT_EVQ` / `INIT_RXQ` /
+`INIT_TXQ`) succeeds without `FULL_FEATURED`; the queue init flags we
+currently send (EVQ: `0x39`, RXQ: `0x300`, TXQ: `0x06`) are all
+accepted. Some MCDI features (notably parts of TSO, RSS-mode
+extensions) remain gated behind `FULL_FEATURED` — keep this in mind
+once we get to MAC/link bring-up and any optional offloads.
 
 `func_flags = 0x6` (LINKCTRL + TRUSTED, no PRIMARY because we attach
 to PF1; PF0 holds PRIMARY).
@@ -404,6 +455,10 @@ called.
 | `sfc7120_mcdi_get_mac` | `MC_CMD_GET_MAC_ADDRESSES (0x55)`. |
 | `sfc7120_mcdi_dump_func_info` | Diagnostic. Runs `GET_PORT_ASSIGNMENT (0xB8)`, `GET_FUNCTION_INFO (0xEC)`, `GET_CAPABILITIES (0xBE)` and dumps the result. Fires on every attach. |
 | `sfc7120_mcdi_alloc_vis` / `_free_vis` | `MC_CMD_ALLOC_VIS (0x8B)` / `MC_CMD_FREE_VIS (0x8C)`. Currently asks for `min=1, max=32`. |
+| `sfc7120_mcdi_vadaptor_alloc` / `_free` | `MC_CMD_VADAPTOR_ALLOC (0x98)` / `MC_CMD_VADAPTOR_FREE (0x99)` on `EVB_PORT_ID_ASSIGNED`. Cap-gates `PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED` (FLAGS1 bit 11). AUTO_MAC. **Do not add an alignment check to `sfc7120_mcdi_exec`** — `IN_LEN=30` is not dword-aligned; see "MCDI byte-length alignment trap" above. |
+| `sfc7120_mcdi_init_evq` / `_fini_evq` | `MC_CMD_INIT_EVQ (0x80)` / `MC_CMD_FINI_EVQ (0x83)`. Currently EVQ 0, 512 entries, ring backed by a single page from `sc->evq_ring_paddr`. Wire flags = `0x39`. |
+| `sfc7120_mcdi_init_rxq` / `_fini_rxq` | `MC_CMD_INIT_RXQ (0x81)` / `MC_CMD_FINI_RXQ (0x84)`. Currently RXQ 0 targeting EVQ 0, 512 descriptors. Wire flags = `0x300`. `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
+| `sfc7120_mcdi_init_txq` / `_fini_txq` | `MC_CMD_INIT_TXQ (0x82)` / `MC_CMD_FINI_TXQ (0x85)`. Currently TXQ 0 targeting EVQ 0, 512 descriptors. Wire flags = `0x06`. `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
 
 ### Error code translation
 
@@ -439,13 +494,26 @@ get_version               (log fw version)
 drv_attach                (declare us as the function's driver)
 entity_reset              (release any lingering function-scope state)
 get_mac                   (populate sc->mac_addr)
-dump_func_info            (diagnostic: port, pf/vf, capabilities)
-alloc_vis(1, 32)          (currently grants 32 VIs at base 1024)
+dump_func_info            (port, pf/vf, capabilities; caches FLAGS1 into
+                           sc->mcdi_cap_flags1 so vadaptor_alloc can
+                           cap-gate the PERMIT_SET_MAC_* flag)
+alloc_vis(1, 32)          (32 VIs at base 1024 on PF1; base 1 on PF0)
+vadaptor_alloc            (binds vAdaptor to EVB_PORT_ID_ASSIGNED with
+                           PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED if
+                           FLAGS1 bit 11 advertised — it is on this fw)
 ```
 
-`log_mc_state` calls are sprinkled between every step for now to make
-MC reboots obvious. They can come out once we're confident the path is
-stable.
+After `hw_init` returns, `sfc7120_fbsd_attach` calls
+`alloc_dma_resources` (EVQ ring, RX/TX desc rings, RX/TX packet
+buffers) and then `init_evq(0) → init_rxq(0, target=0) → init_txq(0,
+target=0)` to program one event queue + one RX queue + one TX queue,
+each 512 entries. Order matters — RXQ/TXQ name EVQ 0 as their target,
+so EVQ 0 must exist first; symmetrically, `fini_txq` / `fini_rxq` run
+before `fini_evq` in teardown.
+
+The failure-path-only `log_mc_state` calls in `sfc7120_hw_init` make
+MC reboots obvious if a step regresses. They only fire when something
+breaks, so the success path is no longer noisy.
 
 ---
 
@@ -572,9 +640,12 @@ as authoritative.
 | Per-function reset | Done | `MC_CMD_ENTITY_RESET` between `DRV_ATTACH` and `GET_MAC`; replaces FLR for clean re-attach. |
 | VI allocation | Done | `MC_CMD_ALLOC_VIS(min=1, max=32)` returns 32 VIs at base 1024. Stored in `sc->vi_count` / `sc->vi_base`. |
 | MCDI mailbox DMA | Done | 256-byte aligned, BUS_DMA_COHERENT. Allocated in `sfc7120_mcdi_init`. |
-| TX/RX packet-buffer DMA | Partial | `sfc7120_alloc_dma_resources` runs cleanly per dmesg `alloc_dma_resources done` line — verify it actually allocates the rings/buffers we'll need for queue init. |
-| EVQ / TXQ / RXQ init | **TODO** | Need `MC_CMD_INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` next. See "Recommended Implementation Order". |
-| MAC reconfigure / link bring | **TODO** | `MC_CMD_MAC_RECONFIGURE`, link/PHY config not yet issued. |
+| TX/RX packet-buffer DMA | Done | `sfc7120_alloc_dma_resources` allocates EVQ ring, RX desc ring, TX desc ring (one page each), plus 1 MB RX and 1 MB TX packet buffers, all BUS_DMA_COHERENT. Physical addresses cached in `sc->evq_ring_paddr` / `sc->rx_desc_ring_paddr` / `sc->tx_desc_ring_paddr` etc. for the queue-init MCDI calls. |
+| vAdaptor allocation | Done | `MC_CMD_VADAPTOR_ALLOC` on `EVB_PORT_ID_ASSIGNED` with `PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED` cap-gated. Freed in `hw_teardown`. See "MCDI byte-length alignment trap" — `IN_LEN=30` is not dword-aligned and **must not** be pre-rejected in `sfc7120_mcdi_exec`. |
+| EVQ init | Done | `MC_CMD_INIT_EVQ (0x80)` programs EVQ 0 with 512 entries, flags `0x39`, ring at `sc->evq_ring_paddr`. `fini_evq` is called in teardown. |
+| RXQ init | Done | `MC_CMD_INIT_RXQ (0x81)` programs RXQ 0 → EVQ 0, 512 descriptors, flags `0x300`, ring at `sc->rx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
+| TXQ init | Done | `MC_CMD_INIT_TXQ (0x82)` programs TXQ 0 → EVQ 0, 512 descriptors, flags `0x06`, ring at `sc->tx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
+| MAC reconfigure / link bring | **TODO** | `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE` and `MC_CMD_SET_LINK` not yet issued; the interface won't pass traffic until they are. |
 | Interrupt handler | **TODO** | Skeleton (`sfc7120_interrupt_handler`, `sfc7120_rx_task_handler`) exists but unused — will be wired once MSI-X allocation lands. |
 | TX/RX IOCTLs (`SFC7120_TX`, `SFC7120_RX`) | **TODO** | Return ENOSYS today |
 | `SFC7120_GET_MAC` | Done | Returns `sc->mac_addr` populated by `MC_CMD_GET_MAC_ADDRESSES`. |
@@ -596,12 +667,19 @@ seq/epoch handling, error xlate. See "MCDI Implementation" above.
 
 ✅ **MCDI identity bringup** — `GET_VERSION`, `DRV_ATTACH`,
 `ENTITY_RESET`, `GET_MAC`, `GET_PORT_ASSIGNMENT`, `GET_FUNCTION_INFO`,
-`GET_CAPABILITIES`, `ALLOC_VIS`. Currently grants 32 VIs at base 1024.
+`GET_CAPABILITIES`, `ALLOC_VIS`. Currently grants 32 VIs at base 1024
+on PF1 (base 1 on PF0).
 
-🔜 **Per-queue MCDI init** — `MC_CMD_INIT_EVQ`, `MC_CMD_INIT_RXQ`,
-`MC_CMD_INIT_TXQ`. Each takes a buffer-table-backed descriptor ring
-(see EF10 buftbl mechanism — ALLOC_BUFTBL_CHUNK + PROGRAM_BUFTBL_ENTRIES).
-Reference: `ef10_ev.c`, `ef10_rx.c`, `ef10_tx.c` in sfxge.
+✅ **vAdaptor allocation** — `MC_CMD_VADAPTOR_ALLOC` on
+`EVB_PORT_ID_ASSIGNED`. Cap-gates `PERMIT_SET_MAC_WHEN_FILTERS_INSTALLED`.
+Single-call wrapper that mirrors sfxge's `efx_mcdi_vadaptor_alloc`.
+
+✅ **Per-queue MCDI init** — `MC_CMD_INIT_EVQ`, `MC_CMD_INIT_RXQ`,
+`MC_CMD_INIT_TXQ`. Currently one queue of each, 512 descriptors,
+ring DMA addresses come from `sfc7120_alloc_dma_resources`. (We did
+**not** end up needing `ALLOC_BUFTBL_CHUNK` / `PROGRAM_BUFTBL_ENTRIES`
+for this firmware variant — `INIT_*Q` accepted the ring paddrs
+directly.) Reference: `ef10_ev.c`, `ef10_rx.c`, `ef10_tx.c` in sfxge.
 
 🔜 **MAC config + link bring** — `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE`,
 `MC_CMD_SET_LINK`, `MC_CMD_GET_LINK` to confirm.
@@ -669,21 +747,21 @@ Confirm against the actual board with `pciconf -lv` and adjust
 
 ## Known Gaps
 
-- **No queue init.** `INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` not yet issued.
-  The 32 VIs we got from `ALLOC_VIS` are reserved but unprogrammed.
-- **No buffer-table programming.** EF10 descriptor rings live in the
-  shared buffer table; we haven't called `ALLOC_BUFTBL_CHUNK` /
-  `PROGRAM_BUFTBL_ENTRIES` yet.
+- **Only one EVQ / RXQ / TXQ.** We program a single triplet at
+  instance 0. Multi-queue (one queue per VI, RSS, etc.) is future
+  work; the slice manifest will need extending to expose multiple
+  doorbell windows then.
 - **No MAC / link config.** `MC_CMD_SET_MAC`, `MC_CMD_SET_LINK` aren't
   called; the interface won't pass traffic until they are.
 - **No interrupt path.** MSI-X allocation + EVQ walking still TODO.
   `sfc7120_interrupt_handler` is defined but unused (compiler warning).
+  EVQ 0 is currently programmed with `INTERRUPTING` set (flags `0x39`
+  includes bit 3) but no MSI-X vector is allocated, so events would
+  back up if traffic flowed today.
 - **`sfc7120_mcdi_reboot_after_assertion` is dead code right now.**
   Defined but not called. Decide: keep as a recovery utility, or
   delete. Removing requires no callers; keep if you anticipate needing
   to recover from MC reboot mid-run.
-- **`log_mc_state` calls in `hw_init` are noisy.** They were added for
-  the v1/v2 debug. Trim once we're confident the path is stable.
 - **Slice manifest offsets are placeholders.** Confirm the doorbell /
   ring-pointer offsets against the EF10 register layout in sfxge before
   exposing them to userspace. Wrong offsets here become a CHERI bounds
