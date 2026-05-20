@@ -563,6 +563,35 @@ sfc7120_fbsd_attach(device_t dev)
     sc->smem[SFC7120_MMIO_REGION].is_sliced   = true;
     sc->smem[SFC7120_MMIO_REGION].slice_definitions = sfc7120_reg_slices;
     sc->smem[SFC7120_MMIO_REGION].slice_def_len     = SFC7120_MMIO_SLICE_COUNT;
+
+    /* EVQ ring is intentionally NOT registered in smem[] yet.
+     *
+     * Current approach (barebones / phase 1): TX and RX are driven through
+     * the SFC7120_TX / SFC7120_RX ioctls. The kernel walks the EVQ, processes
+     * completions, and copies data to/from userspace. The kernel stays in the
+     * data path. This is enough to prove correctness and get traffic flowing.
+     *
+     * Arthur: i'm going to start building out the user library under the above approach until ioctl infra built out finn 
+     *
+     * End goal (direct path / phase 2): remove the kernel from the data path
+     * entirely. Userspace gets a CHERI capability to the EVQ ring and polls
+     * it directly — each slot is 8 bytes, bit 63 is the valid marker (ring is
+     * pre-filled 0xff at alloc; the NIC clears bit 63 when it writes a real
+     * event). TX completions arrive as EV_CODE_TX_EV (code=2) events carrying
+     * the completed descriptor index. RX arrivals arrive as EV_CODE_RX_EV
+     * (code=0) events carrying byte count and descriptor pointer bits.
+     * After consuming an event, userspace writes the consumed index back to
+     * the EVQ read-pointer doorbell (SFC7120_REG_EVQ_RPTR_DBL) to free the
+     * slot — no syscall. TX sends follow the same pattern: userspace writes
+     * a descriptor into the TX ring and rings the TX doorbell register
+     * (SFC7120_REG_TX_DESC_DBL) directly through the MMIO slice.
+     *
+     * To enable phase 2: add SFC7120_EVQ_RING to sfc7120_vm_map_type_t in
+     * sfc7120_uapi.h, bump SFC7120_REGION_COUNT, populate smem[] here
+     * (is_physical=false, addr=sc->evq_ring, len=NUM_EVQ_ENTRY*EVQ_ENTRY_SIZE,
+     * is_sliced=false), and add SFC7120_REG_EVQ_RPTR_DBL to the MMIO slice
+     * manifest so userspace can ack events without a syscall. */
+
     device_printf(dev, "TRACE: smem populated\n");
 
     /* 6. init_capio_sc. MUST come AFTER make_dev_capio and AFTER smem[]

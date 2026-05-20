@@ -1,10 +1,19 @@
-# CheriBsdSolarflare7120 — Solarflare 7120 CAPIO Kernel Driver Stub
+# CheriBsdSolarflare7120 — Solarflare 7120 CAPIO Kernel Driver + Userspace Library
 
 ## What This Directory Is
 
 Out-of-tree workspace for the Solarflare SFN7000-series (Huntington / EF10)
-CAPIO kernel driver stub. Modeled on `~/CheriBsdE1000/`: cross-compile via
-bmake on Linux, native make on CheriBSD, output `sfc7120pol.ko`.
+CAPIO driver stack. Contains two components that live together in this repo:
+
+- **Kernel module** (`sfc7120pol.ko`) — PCI driver, MCDI firmware transport,
+  queue init, CAPIO wiring. Cross-compile via bmake on Linux, native make on
+  CheriBSD. Modeled on `~/CheriBsdE1000/` for the kernel conventions.
+- **Userspace library** (`userlib/sfc7120_user.c`) — hand-rolled
+  Ethernet/IP/UDP driver that opens `/dev/sfc7120pol`, attaches via CAPIO,
+  and communicates directly with the NIC through mmapped DMA buffers and MMIO
+  register slices. No lwIP dependency. Phase 1 drives TX/RX through ioctls;
+  phase 3 removes the kernel from the data path entirely via direct EVQ
+  polling.
 
 **Status: ATTACHES CLEANLY WITH QUEUES INITIALIZED (as of 2026-05-18).**
 The PCI driver, CAPIO wiring, IOCTL dispatch, slice manifest, MCDI
@@ -21,10 +30,10 @@ DMA rings + packet buffers, cdev creation, smem population, and
 attached`.
 
 Still **TODO**: MAC reconfiguration + link bring-up
-(`MC_CMD_SET_MAC` / `MC_CMD_SET_LINK`), MSI-X interrupt handler + EVQ
-event walking, TX/RX IOCTL bodies, in-tree copy at
-`~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
-`~/E1000Lwip/netif/sfc7120_driver.c`.
+(`MC_CMD_SET_MAC` / `MC_CMD_SET_LINK`), TX/RX IOCTL bodies, in-tree
+copy at `~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
+`userlib/sfc7120_user.c` in this repo (hand-rolled Ethernet/IP/UDP, no
+lwIP dependency; phase 1 via ioctls, phase 3 direct EVQ polling).
 
 ---
 
@@ -520,7 +529,7 @@ breaks, so the success path is no longer noisy.
 ## Role in the Larger System
 
 ```
-Userspace (E1000Lwip/netif/sfc7120_driver.c — TO BE WRITTEN)
+Userspace (userlib/sfc7120_user.c — IN PROGRESS)
   │  open("/dev/sfc7120pol")
   │  ioctl(CAPIO_ATTACH)          ──────► Kernel (this module)
   │                                         seals userspace cap
@@ -646,11 +655,11 @@ as authoritative.
 | RXQ init | Done | `MC_CMD_INIT_RXQ (0x81)` programs RXQ 0 → EVQ 0, 512 descriptors, flags `0x300`, ring at `sc->rx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
 | TXQ init | Done | `MC_CMD_INIT_TXQ (0x82)` programs TXQ 0 → EVQ 0, 512 descriptors, flags `0x06`, ring at `sc->tx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
 | MAC reconfigure / link bring | **TODO** | `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE` and `MC_CMD_SET_LINK` not yet issued; the interface won't pass traffic until they are. |
-| Interrupt handler | **TODO** | Skeleton (`sfc7120_interrupt_handler`, `sfc7120_rx_task_handler`) exists but unused — will be wired once MSI-X allocation lands. |
+| Interrupt handler | **Not planned** | MSI-X interrupt path not used — userspace drives TX/RX via ioctls (phase 1) then direct EVQ polling (phase 3). |
 | TX/RX IOCTLs (`SFC7120_TX`, `SFC7120_RX`) | **TODO** | Return ENOSYS today |
 | `SFC7120_GET_MAC` | Done | Returns `sc->mac_addr` populated by `MC_CMD_GET_MAC_ADDRESSES`. |
 | In-tree copy | Not yet | Add to `~/cheri/cheribsd/sys/modules/sfc7120pol/` once queue init lands. |
-| Userspace counterpart | Not yet | Add to `~/E1000Lwip/netif/sfc7120_driver.c` (mirror `mlx5_driver.c`). |
+| Userspace counterpart | In progress | `userlib/sfc7120_user.c` in this repo. Hand-rolled Ethernet/IP/UDP, no lwIP. Phase 1 via ioctls, phase 3 direct EVQ polling. |
 
 ---
 
@@ -692,8 +701,10 @@ warnings during build — those will go away once they're wired).
 🔜 **TX/RX IOCTLs** — kernel-mediated fallback paths for testing before
 the userspace driver lands.
 
-🔜 **Userspace driver** — `~/E1000Lwip/netif/sfc7120_driver.c`, registers
-as a lwIP `netif`. Mirror `~/E1000Lwip/netif/mlx5_driver.c`.
+🔜 **Userspace driver** — `userlib/sfc7120_user.c` in this repo.
+Hand-rolled Ethernet/IP/UDP frames written directly into the mmapped TX
+buffer. No lwIP dependency. Phase 1: TX/RX via ioctls. Phase 3: direct
+EVQ polling + doorbell writes through MMIO slice, kernel out of data path.
 
 🔜 **In-tree copy** — once stable, copy under
 `~/cheri/cheribsd/sys/modules/sfc7120pol/` so it builds into the
@@ -768,7 +779,7 @@ Confirm against the actual board with `pciconf -lv` and adjust
   violation at the userspace driver, not a kernel panic — easy to miss.
 - **No in-tree copy.** Add `~/cheri/cheribsd/sys/modules/sfc7120pol/`
   with VPATH-shared `capio.c` once driver stabilizes.
-- **No userspace driver.** Add `~/E1000Lwip/netif/sfc7120_driver.c`.
+- **No userspace driver.** `userlib/sfc7120_user.c` is in progress — hand-rolled packets, no lwIP.
 - `vm_object_handle_t` allocations *are* freed in detach (the loop is
   in `sfc7120_fbsd_detach` before `destroy_dev`) — flagging this only
   because the e1000 out-of-tree copy is missing that loop.
