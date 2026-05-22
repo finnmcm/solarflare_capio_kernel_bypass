@@ -1219,9 +1219,11 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
       *(uint32_t *)(buf + 40),
       (uintmax_t)paddr, (uintmax_t)(paddr & 0xfff));
 
-    /* OUT carries the IRQ number when FLAG_INTERRUPTING is set; we don't
-     * set it yet (MSI-X not wired). Allocate and zero it anyway so exec
-     * has a non-NULL response sink. */
+    /* OUT.IRQ at offset 0 is documented but NOT populated by firmware on
+     * this card — sfxge explicitly ignores it (ef10_ev.c:255: "ignore the
+     * returned IRQ param as firmware does not set it"). Anything we'd
+     * read there is stale mailbox content. Still ask for OUT_LEN bytes so
+     * we get a length-sanity check inside exec, but discard the value. */
     uint32_t out = 0;
     size_t   out_used = 0;
 

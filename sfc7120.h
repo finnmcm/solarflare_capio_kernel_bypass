@@ -144,10 +144,17 @@ typedef struct sfc7120_softc {
 
     uint8_t             mac_addr[6];
 
-    /* Interrupt resources (MSI-X is the EF10 norm; legacy fallback omitted) */
+    /* Interrupt resources (MSI-X is the EF10 norm; legacy fallback omitted).
+     * BAR4 backs the MSI-X table + PBA (16 KB on SFN7322F-R2). We allocate it
+     * explicitly so the kernel can map the table, then ask for one MSI-X
+     * vector at RID 1. */
+    struct resource    *msix_bar_resource;
+    int                 msix_bar_rid;
+    int                 msix_nvec;
     struct resource    *irq_resource;
     int                 irq_res_id;
     void               *irq_handle;
+    bool                intr_initialized;
 
     /* Event queue (EVQ) — DMA buffer of 64-bit events */
     void               *evq_ring;
