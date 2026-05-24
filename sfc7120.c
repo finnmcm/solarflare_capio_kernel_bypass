@@ -306,6 +306,61 @@ sfc7120_free_dma_resources(sfc7120_softc_t *sc)
 /* in sfc7120_mcdi.c.                                                     */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * sfc7120_post_rx_buffers — seed the RX descriptor ring at attach time.
+ *
+ * After INIT_RXQ the firmware knows the ring exists but the ring itself is
+ * all zeros — the NIC has nowhere to put incoming packets. This function
+ * writes one 8-byte descriptor per slot telling the NIC the physical address
+ * and capacity of each buffer, then writes the RX doorbell to hand those
+ * slots to the hardware.
+ *
+ * We post NUM_RX_DESC-1 (511) slots rather than all 512. Posting all 512
+ * would wrap the write pointer back to 0, which the hardware reads as
+ * "ring empty." Leaving one slot unposted keeps the pointer at 511 which
+ * is unambiguous.
+ *
+ * After attach, sc->rx_head = 0. Each time the RX ioctl consumes a packet
+ * it will re-post that descriptor and advance rx_head so the ring stays
+ * topped up.
+ */
+static void
+sfc7120_post_rx_buffers(sfc7120_softc_t *sc)
+{
+    volatile uint64_t *ring = (volatile uint64_t *)sc->rx_desc_ring;
+
+    /*
+     * Fill the RX descriptor ring so the NIC knows where to DMA incoming
+     * packets. Each 8-byte descriptor carries:
+     *   bits[61:48] — buffer capacity (BYTE_CNT), always SFC7120_RX_BUFFER_SIZE
+     *   bits[47:32] — upper 16 bits of the slot's physical address
+     *   bits[31:0]  — lower 32 bits of the slot's physical address
+     *
+     * We post NUM_RX_DESC-1 slots, leaving one empty. If we filled all 512
+     * the write pointer would wrap back to 0, which looks identical to an
+     * empty ring. Leaving one slot unposted keeps the pointer unambiguous.
+     */
+    int npost = SFC7120_NUM_RX_DESC - 1;
+    for (int i = 0; i < npost; i++) {
+        bus_addr_t paddr = sc->rx_buffer_paddr + i * SFC7120_RX_BUFFER_SIZE;
+        uint64_t desc =
+            ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48) |
+            ((uint64_t)((paddr >> 32) & 0xffff)           << 32) |
+            ((uint64_t)(paddr & 0xffffffff));
+        ring[i] = desc;
+    }
+
+    /* Flush the descriptor writes to DMA memory before poking the doorbell. */
+    bus_dmamap_sync(sc->rx_desc_dtag, sc->rx_desc_dmamap,
+                    BUS_DMASYNC_PREWRITE);
+
+    /* Tell the NIC: slots 0..(npost-1) are ready. */
+    SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL, (uint32_t)npost);
+    sc->rx_head = 0;
+
+    device_printf(sc->dev, "RX: posted %d buffer descriptors\n", npost);
+}
+
 static int
 sfc7120_hw_init(sfc7120_softc_t *sc)
 {
@@ -511,6 +566,8 @@ sfc7120_fbsd_attach(device_t dev)
         goto fail_dma;
     }
     device_printf(dev, "TRACE: init_rxq done\n");
+
+    sfc7120_post_rx_buffers(sc);
 
     /* INITIALIZING TX QUEUE */
     device_printf(dev, "TRACE: calling init_txq\n");
