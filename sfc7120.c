@@ -1009,28 +1009,9 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 
             uint32_t code = (uint32_t)(ev >> 60) & 0xf;
             if (code == 0) { /* RX_EV */
-                /* --- Step 2: extract byte count and descriptor index --- */
+                /* Extract byte count (includes 14-byte EF10 prefix). Trust
+                 * rx_head as the slot — same approach as Finn's ISR path. */
                 rx_bytes = (uint32_t)(ev & 0x3fff);
-                uint32_t dsc_lbits = (uint32_t)((ev >> 48) & 0xf);
-
-                /* --- Step 3: verify we are on the right slot ---
-                 * The event only carries the low 4 bits of the descriptor
-                 * index. We cross-check against the low 4 bits of rx_head
-                 * to confirm they match. If they don't, something has gone
-                 * out of sync — bail rather than copying from the wrong
-                 * slot. */
-                if ((sc->rx_head & 0xf) != dsc_lbits) {
-                    device_printf(sc->dev,
-                        "RX ioctl: dsc_lbits mismatch: event=%u rx_head=%u\n",
-                        dsc_lbits, sc->rx_head & 0xf);
-                    evq[sc->evq_read_ptr] = 0;
-                    sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
-                                       (SFC7120_NUM_EVQ_ENTRY - 1);
-                    SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                                      (uint32_t)sc->evq_read_ptr);
-                    SFC7120_UNLOCK(sc);
-                    return EIO;
-                }
                 rx_found = 1;
             }
 
