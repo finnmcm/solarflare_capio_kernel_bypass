@@ -1,8 +1,12 @@
 #ifndef SFC7120_UAPI_H
 #define SFC7120_UAPI_H
 
+#ifdef _KERNEL
+#include <sys/types.h>
+#else
 #include <stdint.h>
 #include <stddef.h>
+#endif
 #include <sys/ioccom.h>
 
 /* Queue geometry — must match the kernel ring allocations. */
