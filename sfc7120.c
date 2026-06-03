@@ -57,23 +57,18 @@ static int  sfc7120_fbsd_probe(device_t dev);
 static int  sfc7120_fbsd_attach(device_t dev);
 static int  sfc7120_fbsd_detach(device_t dev);
 static void sfc7120_interrupt_handler(void *arg);
-static void sfc7120_rx_task_handler(void *context, int pending);
 static int  sfc7120_intr_setup(sfc7120_softc_t *sc);
 static void sfc7120_intr_teardown(sfc7120_softc_t *sc);
-static void sfc7120_rx_post_initial(sfc7120_softc_t *sc);
+static void sfc7120_rx_task_handler(void *context, int pending);
 
 /* EF10 RX prefix: 14-byte pseudo-header prepended when INIT_RXQ FLAG_PREFIX
- * is set (our flags=0x300 includes bit 8).  Layout per ef10_rx.c:737:
+ * is set (our flags=0x300 includes bit 8). Layout per ef10_rx.c:737:
  *   +0x00  hash32 (LE)
  *   +0x04  outer VLAN (BE)
  *   +0x06  inner VLAN (BE)
- *   +0x08  packet length (LE, excl. prefix; 0 = cut-through mode)
+ *   +0x08  packet length (LE uint16, excl. prefix; 0 = cut-through mode)
  *   +0x0a  MAC timestamp (LE) */
 #define SFC7120_EF10_RX_PREFIX_LEN  14
-
-/* EF10 RX write-pointer alignment requirement (EF10_RX_WPTR_ALIGN in
- * ef10_impl.h).  The RX doorbell wptr must be a multiple of this. */
-#define SFC7120_RX_WPTR_ALIGN       8
 
 #define SFC7120_LOCK_INIT(sc) \
     mtx_init(&(sc)->sc_mtx, device_get_nameunit((sc)->dev), \
@@ -88,15 +83,6 @@ static void sfc7120_rx_post_initial(sfc7120_softc_t *sc);
 #define SFC7120_RX_LOCK(sc)         mtx_lock(&(sc)->rx_mtx)
 #define SFC7120_RX_UNLOCK(sc)       mtx_unlock(&(sc)->rx_mtx)
 #define SFC7120_RX_LOCK_DESTROY(sc) mtx_destroy(&(sc)->rx_mtx)
-
-/* TX submitter lock — see sfc7120.h.  Lock order: tx_submit_mtx (outer) →
- * sc_mtx (inner) for counter R/M/W only.  Never nested with rx_mtx. */
-#define SFC7120_TX_SUBMIT_LOCK_INIT(sc) \
-    mtx_init(&(sc)->tx_submit_mtx, device_get_nameunit((sc)->dev), \
-             "sfc7120 tx submit lock", MTX_DEF)
-#define SFC7120_TX_SUBMIT_LOCK(sc)         mtx_lock(&(sc)->tx_submit_mtx)
-#define SFC7120_TX_SUBMIT_UNLOCK(sc)       mtx_unlock(&(sc)->tx_submit_mtx)
-#define SFC7120_TX_SUBMIT_LOCK_DESTROY(sc) mtx_destroy(&(sc)->tx_submit_mtx)
 
 /*
  * Solarflare PCI device IDs.
@@ -260,13 +246,25 @@ sfc7120_alloc_dma_resources(sfc7120_softc_t *sc)
     memset(sc->evq_ring, 0xff, evq_size);
     bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap, BUS_DMASYNC_PREWRITE);
 
+    /* Data EVQ ring (instance 1): same geometry as the control EVQ. Primed
+     * to 0xff for the same "valid event" detection as EVQ 0. */
+    error = sfc7120_alloc_dmabuf(sc->dev,
+                                 &sc->data_evq_dtag, &sc->data_evq_dmamap,
+                                 &sc->data_evq_ring, &sc->data_evq_ring_paddr,
+                                 evq_size, 4096, "data EVQ ring");
+    if (error != 0)
+        goto fail_evq;
+    memset(sc->data_evq_ring, 0xff, evq_size);
+    bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
+                    BUS_DMASYNC_PREWRITE);
+
     /* TX descriptor ring: driver writes outgoing packet descriptors here. */
     error = sfc7120_alloc_dmabuf(sc->dev,
                                  &sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                                  &sc->tx_desc_ring, &sc->tx_desc_ring_paddr,
                                  txd_size, 4096, "TX desc ring");
     if (error != 0)
-        goto fail_evq;
+        goto fail_data_evq;
 
     /* RX descriptor ring: driver writes free buffer addresses here. */
     error = sfc7120_alloc_dmabuf(sc->dev,
@@ -303,6 +301,9 @@ fail_rxd:
 fail_txd:
     sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                         &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+fail_data_evq:
+    sfc7120_free_dmabuf(&sc->data_evq_dtag, &sc->data_evq_dmamap,
+                        &sc->data_evq_ring, &sc->data_evq_ring_paddr);
 fail_evq:
     sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
                         &sc->evq_ring, &sc->evq_ring_paddr);
@@ -320,51 +321,10 @@ sfc7120_free_dma_resources(sfc7120_softc_t *sc)
                         &sc->rx_desc_ring, &sc->rx_desc_ring_paddr);
     sfc7120_free_dmabuf(&sc->tx_desc_dtag, &sc->tx_desc_dmamap,
                         &sc->tx_desc_ring, &sc->tx_desc_ring_paddr);
+    sfc7120_free_dmabuf(&sc->data_evq_dtag, &sc->data_evq_dmamap,
+                        &sc->data_evq_ring, &sc->data_evq_ring_paddr);
     sfc7120_free_dmabuf(&sc->evq_dtag, &sc->evq_dmamap,
                         &sc->evq_ring, &sc->evq_ring_paddr);
-}
-
-/* ---------------------------------------------------------------------- */
-/* RX descriptor ring initialisation                                       */
-/* ---------------------------------------------------------------------- */
-
-/*
- * Post (SFC7120_NUM_RX_DESC - SFC7120_RX_WPTR_ALIGN) = 504 descriptors so
- * the NIC has a deep supply of buffers on first attach.  We intentionally stop
- * one alignment batch short of a full ring so the initial wptr is 504 (not 0)
- * — a wptr of 0 after INIT_RXQ could be ambiguous.
- *
- * Each descriptor is an 8-byte little-endian qword:
- *   bits[47:0]  = physical buffer address (48-bit)
- *   bits[61:48] = buffer byte count (14-bit; BYTE_CNT field)
- *   bits[63:62] = RESERVED (0)
- * (ESF_DZ_RX_KER_* in efx_regs_ef10.h; ef10_rx.c:ef10_rx_qpost.)
- *
- * The wptr is written to SFC7120_REG_RX_DESC_DBL (ER_DZ_RX_DESC_UPD_REG_OFST
- * = 0x0830, function-local VI 0), value = produced & (ring_size - 1).
- * EF10 requires this to be aligned to EF10_RX_WPTR_ALIGN (8).
- */
-static void
-sfc7120_rx_post_initial(sfc7120_softc_t *sc)
-{
-    uint64_t *ring = (uint64_t *)sc->rx_desc_ring;
-    int n = SFC7120_NUM_RX_DESC - SFC7120_RX_WPTR_ALIGN; /* 504 */
-
-    for (int i = 0; i < n; i++) {
-        bus_addr_t paddr = sc->rx_buffer_paddr +
-                           (bus_addr_t)i * SFC7120_RX_BUFFER_SIZE;
-        uint64_t desc = (paddr & 0x0000ffffffffffffULL) |
-                        ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48);
-        ring[i] = htole64(desc);
-    }
-    bus_dmamap_sync(sc->rx_desc_dtag, sc->rx_desc_dmamap, BUS_DMASYNC_PREWRITE);
-
-    sc->rx_pushed = n;
-    /* wptr must be aligned to SFC7120_RX_WPTR_ALIGN; n=504 is already aligned. */
-    uint32_t wptr = (uint32_t)(n & (SFC7120_NUM_RX_DESC - 1)); /* 504 */
-    SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL, wptr);
-    device_printf(sc->dev,
-        "RX: posted %d initial descriptors, wptr=%u\n", n, wptr);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -511,10 +471,6 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
-    /* MAC + PHY bring-up. Without these the MAC stays drained and the PHY
-     * never negotiates a link, so the host-side queues we program in
-     * sfc7120_fbsd_attach would never see traffic. Mirrors sfxge
-     * efx_port_init (efx_port.c:37-99). */
     error = sfc7120_mcdi_get_phy_cfg(sc);
     if (error != 0) {
         device_printf(sc->dev, "hw_init: GET_PHY_CFG failed: %d\n", error);
@@ -533,17 +489,20 @@ sfc7120_hw_init(sfc7120_softc_t *sc)
         goto fail_attach;
     }
 
-    /* Seed link state with a single GET_LINK so any consumer that reads
-     * sc->link_* before the first LINKCHANGE event arrives sees something
-     * coherent. Subsequent state transitions are delivered as LINKCHANGE
-     * events on the EVQ and decoded by sfc7120_interrupt_handler. A link-
-     * down outcome here is non-fatal — an unwired cage stays down until
-     * a peer comes up and the firmware fires the event. */
-    (void)sfc7120_mcdi_get_link(sc);
-    if (!sc->link_up) {
-        device_printf(sc->dev,
-            "hw_init: initial link DOWN; waiting for LINKCHANGE\n");
+    /* Poll for link-up, up to 3 s (30 × 100 ms). Not fatal if it stays
+     * down — cable may be unplugged; we continue and let TX/RX fail later. */
+    for (int i = 0; i < 30; i++) {
+        error = sfc7120_mcdi_get_link(sc);
+        if (error != 0) {
+            device_printf(sc->dev, "hw_init: GET_LINK failed: %d\n", error);
+            goto fail_attach;
+        }
+        if (sc->link_up)
+            break;
+        pause("sfc7120_lnk", hz / 10);
     }
+    if (!sc->link_up)
+        device_printf(sc->dev, "hw_init: link not up after 3s (cable disconnected?)\n");
 
     return 0;
 
@@ -565,13 +524,11 @@ sfc7120_hw_teardown(sfc7120_softc_t *sc)
      * Order matters: FINI_TXQ / FINI_RXQ must complete before FINI_EVQ
      * (firmware returns EBUSY otherwise — RX/TX queues hold a reference to
      * their target EVQ). VADAPTOR_FREE must happen before FREE_VIS. */
-    (void)sfc7120_mcdi_fini_txq(sc, 0);
-    /* Remove the RX filter before tearing down RXQ 0 it points at — the
-     * filter references the RX queue, so it must go first. Self-guards on
-     * sc->rx_filter_inserted, so this is a no-op if insert never ran. */
     (void)sfc7120_mcdi_filter_remove(sc);
+    (void)sfc7120_mcdi_fini_txq(sc, 0);
     (void)sfc7120_mcdi_fini_rxq(sc, 0);
-    (void)sfc7120_mcdi_fini_evq(sc, 0);
+    (void)sfc7120_mcdi_fini_evq(sc, 1);   /* data EVQ first (reverse of init) */
+    (void)sfc7120_mcdi_fini_evq(sc, 0);   /* control EVQ — the wakeup anchor */
     (void)sfc7120_mcdi_vadaptor_free(sc);
     (void)sfc7120_mcdi_free_vis(sc);
     (void)sfc7120_mcdi_drv_detach(sc);
@@ -613,7 +570,6 @@ sfc7120_fbsd_attach(device_t dev)
     //finn: sc_mtx : main device lock, protects fields touched by multiple contexts. mutex taken by any thread that wants to use shared fields
     SFC7120_LOCK_INIT(sc);
     SFC7120_RX_LOCK_INIT(sc);
-    SFC7120_TX_SUBMIT_LOCK_INIT(sc);
 
     /* 1. Allocate BAR2 (function MMIO window). */
     device_printf(dev, "TRACE: about to alloc BAR2\n");
@@ -640,26 +596,26 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: hw_init done\n");
 
-    /* 2a. MSI-X allocation. Must run before INIT_EVQ so the firmware can
-     *     deliver events into a valid vector the moment the queue is armed.
-     *     A spurious interrupt before evq_initialized=true is harmless — the
-     *     ISR bails on the !evq_initialized guard. */
-    device_printf(dev, "TRACE: calling intr_setup\n");
-    error = sfc7120_intr_setup(sc);
-    if (error != 0) {
-        device_printf(dev, "intr_setup failed: %d\n", error);
-        goto fail_hw;
-    }
-    device_printf(dev, "TRACE: intr_setup done\n");
 
     /* 3. DMA buffer allocation. */
     device_printf(dev, "TRACE: calling alloc_dma_resources\n");
     error = sfc7120_alloc_dma_resources(sc);
     if (error != 0) {
         device_printf(dev, "alloc_dma_resources failed: %d\n", error);
-        goto fail_intr;
+        goto fail_hw;
     }
     device_printf(dev, "TRACE: alloc_dma_resources done\n");
+
+    /* MSI-X allocation. Runs before INIT_EVQ so the interrupting control EVQ
+     * (0) has its vector ready. A spurious interrupt before
+     * evq_initialized=true is harmless — the handler's latch bails. */
+    device_printf(dev, "TRACE: calling intr_setup\n");
+    error = sfc7120_intr_setup(sc);
+    if (error != 0) {
+        device_printf(dev, "intr_setup failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: intr_setup done\n");
 
     /* INITIALIZING EVENT QUEUE */
     device_printf(dev, "TRACE: calling init_evq\n");
@@ -672,12 +628,32 @@ sfc7120_fbsd_attach(device_t dev)
         device_printf(dev, "init_evq failed: %d\n", error);
         goto fail_dma;
     }
-    device_printf(dev, "TRACE: init_evq done\n");
+    device_printf(dev, "TRACE: init_evq done (control, EVQ 0)\n");
 
-    /* INITIALIZING RX QUEUE. instance and target_evq are function-local
-     * indices (0..vi_count-1), matching EVQ instance 0 above. */
+    /* Control EVQ is up: track its init state (for symmetric fini) and arm
+     * the ISR. The handler only reads EVQ 0, so arming here — before EVQ 1
+     * exists — is safe. */
+    sc->evq_initialized = true;
+
+    /* Data EVQ (instance 1): non-interrupting, carries TX/RX completions.
+     * Created AFTER EVQ 0 — a non-interrupting EVQ must reference an
+     * already-existing interrupting EVQ (EVQ 0) for wake-ups. */
+    error = sfc7120_mcdi_init_evq(sc, 1, sc->data_evq_ring_paddr,
+                                  SFC7120_NUM_EVQ_ENTRY);
+    if (error != 0) {
+        device_printf(dev, "init_evq(data) failed: %d\n", error);
+        goto fail_dma;
+    }
+    device_printf(dev, "TRACE: init_evq done (data, EVQ 1)\n");
+
+    /* Track data EVQ init state for symmetric fini. */
+    sc->data_evq_initialized = true;
+
+    /* INITIALIZING RX QUEUE. Args: (instance, target_evq, ...). RXQ 0's
+     * completion events are steered to the DATA EVQ (instance 1), not the
+     * control EVQ — this retarget is what frees EVQ 0 to become control-only. */
     device_printf(dev, "TRACE: calling init_rxq\n");
-    error = sfc7120_mcdi_init_rxq(sc, 0, 0, sc->rx_desc_ring_paddr,
+    error = sfc7120_mcdi_init_rxq(sc, 0, 1, sc->rx_desc_ring_paddr,
                                   SFC7120_NUM_RX_DESC);
     if (error != 0) {
         device_printf(dev, "init_rxq failed: %d\n", error);
@@ -687,9 +663,10 @@ sfc7120_fbsd_attach(device_t dev)
 
     sfc7120_post_rx_buffers(sc);
 
-    /* INITIALIZING TX QUEUE */
+    /* INITIALIZING TX QUEUE. TXQ 0's completion events likewise go to the
+     * DATA EVQ (instance 1). */
     device_printf(dev, "TRACE: calling init_txq\n");
-    error = sfc7120_mcdi_init_txq(sc, 0, 0, sc->tx_desc_ring_paddr,
+    error = sfc7120_mcdi_init_txq(sc, 0, 1, sc->tx_desc_ring_paddr,
                                   SFC7120_NUM_TX_DESC);
     if (error != 0) {
         device_printf(dev, "init_txq failed: %d\n", error);
@@ -697,32 +674,14 @@ sfc7120_fbsd_attach(device_t dev)
     }
     device_printf(dev, "TRACE: init_txq done\n");
 
-    /* INSERT RX FILTER. RXQ 0 must already exist (above) — the filter names
-     * RX queue 0 as its destination. Without a filter the MC drops every RX
-     * frame before it reaches the ring, so this is the last blocker for RX
-     * delivery. Treated like the other queue-init steps: log and bail to
-     * fail_dma on error rather than half-attaching. */
-    device_printf(dev, "TRACE: calling filter_insert\n");
+    /* Insert RX filter so the MC steers incoming frames to RXQ 0.
+     * Must come after INIT_RXQ since the filter names RX queue 0 as its
+     * destination. Without this, the firmware drops all RX frames. */
     error = sfc7120_mcdi_filter_insert(sc);
     if (error != 0) {
         device_printf(dev, "filter_insert failed: %d\n", error);
         goto fail_dma;
     }
-    device_printf(dev, "TRACE: filter_insert done\n");
-
-    /* Initialize TX ring counters before posting any descriptors.
-     * tx_descriptors_free MUST be set; it defaults to 0 from the zero-init
-     * softc which would block all transmits. */
-    sc->tx_head             = 0;
-    sc->tx_tail             = 0;
-    sc->tx_descriptors_free = SFC7120_NUM_TX_DESC;
-    sc->rx_head             = 0;
-    sc->rx_completion_tail  = 0;
-    /* rx_event_bytes_ring[] left zeroed by softc M_ZERO alloc. */
-
-    /* Post the initial RX descriptor batch so the NIC has buffers ready.
-     * Sets sc->rx_pushed — must come AFTER the zeroing above. */
-    sfc7120_rx_post_initial(sc);
 
     /* 4. Create cdev. make_dev_capio overwrites d_ioctl with
      *    capio_ioctl_handler and registers the modmap callbacks. */
@@ -818,23 +777,20 @@ sfc7120_fbsd_attach(device_t dev)
     return 0;
 
 fail_dma:
-    /* FINI the queues (inside hw_teardown) BEFORE freeing the DMA rings the
-     * firmware is writing into — otherwise the NIC keeps DMAing into freed
-     * memory. Then tear down the ISR (drain taskqueue + bus_teardown_intr).
-     * Can't fall through to fail_intr/fail_hw or we'd call those twice. */
+    /* Stop interrupts first — the ISR reads the EVQ DMA we're about to free.
+     * Then FINI the queues (inside hw_teardown) BEFORE freeing the DMA rings
+     * the firmware is writing into — otherwise the NIC keeps DMAing into freed
+     * memory. Can't fall through to fail_hw or we'd call hw_teardown twice. */
+    sfc7120_intr_teardown(sc);
     sfc7120_hw_teardown(sc);
     sfc7120_free_dma_resources(sc);
-    sfc7120_intr_teardown(sc);
     goto fail_bar;
-fail_intr:
-    sfc7120_intr_teardown(sc);
 fail_hw:
     sfc7120_hw_teardown(sc);
 fail_bar:
     pci_disable_busmaster(dev);
     bus_release_resource(dev, SYS_RES_MEMORY, sc->mem_res_id, sc->mem_resource);
 fail_lock:
-    SFC7120_TX_SUBMIT_LOCK_DESTROY(sc);
     SFC7120_RX_LOCK_DESTROY(sc);
     SFC7120_LOCK_DESTROY(sc);
     return error;
@@ -868,14 +824,15 @@ sfc7120_fbsd_detach(device_t dev)
         sc->cdev = NULL;
     }
 
-    /* Firmware teardown (FINI_TXQ/RXQ/EVQ, VADAPTOR_FREE, FREE_VIS, ...)
-     * MUST happen before tearing down the ISR or freeing the DMA rings —
-     * otherwise the NIC keeps DMA-writing events into freed memory and
-     * keeps firing the vector at a torn-down handler. After hw_teardown
-     * the firmware is silent, so the ISR can be safely removed; only
-     * then is it safe to free the EVQ DMA buffer the ISR was reading. */
-    sfc7120_hw_teardown(sc);
+    /* Stop interrupts before fini'ing queues / freeing the EVQ DMA the ISR
+     * reads. (dying=true was set above, so the handler already no-ops; this
+     * guarantees the vector is gone before the memory is.) */
     sfc7120_intr_teardown(sc);
+
+    /* Firmware teardown (FINI_TXQ/RXQ/EVQ, VADAPTOR_FREE, FREE_VIS, ...)
+     * MUST happen before freeing the DMA rings — otherwise the NIC keeps
+     * DMA-writing events/completions into freed memory. */
+    sfc7120_hw_teardown(sc);
     sfc7120_free_dma_resources(sc);
 
     if (sc->mem_resource != NULL) {
@@ -889,7 +846,6 @@ sfc7120_fbsd_detach(device_t dev)
      * initialized by init_capio_sc. */
     capio_destroy(sc);
 
-    SFC7120_TX_SUBMIT_LOCK_DESTROY(sc);
     SFC7120_RX_LOCK_DESTROY(sc);
     SFC7120_LOCK_DESTROY(sc);
     return 0;
@@ -924,7 +880,7 @@ sfc7120_poll(struct cdev *dev, int events, struct thread *td)
         return POLLERR;
 
     SFC7120_RX_LOCK(sc);
-    if (sc->rx_completion_tail != sc->rx_head)
+    if (sc->rx_received)
         revents |= events & (POLLIN | POLLRDNORM);
     else
         selrecord(td, &sc->selinfo);
@@ -1026,8 +982,11 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          * new descriptor is ready. The NIC reads the descriptor, fetches the
          * packet from DMA memory, and transmits it. */
         int posted_idx = sc->tx_head;
-        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_DESC_DBL,
-                          (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1));
+        /* Push TX write pointer via the WRITED2 path.
+         * ERF_DZ_TX_DESC_WPTR lives at dword[2] (LBN=64) of TX_DESC_UPD.
+         * Write to TX_WPTR_DBL = TX_DESC_DBL + 8 = 0x0a18. */
+        uint32_t wptr = (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
+        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_WPTR_DBL, wptr);
 
         /* --- Step 5: poll EVQ for TX completion ---
          * The NIC posts an 8-byte TX_EV event to the EVQ when it finishes
@@ -1036,12 +995,14 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          *   bits[15:0]   TX_DESCR_INDX — index of completed descriptor
          *
          * We spin up to 10000 iterations waiting for it. */
-        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        /* Since 1c, TXQ 0 completions land in the DATA EVQ (instance 1), so
+         * we poll data_evq_ring — not the control EVQ. */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int tx_done = 0;
         for (int tries = 0; tries < 10000 && !tx_done; tries++) {
-            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
-            uint64_t ev = evq[sc->evq_read_ptr];
+            uint64_t ev = evq[sc->data_evq_read_ptr];
 
             /* All-ones or all-zeros means no event written yet. */
             if (ev == 0xffffffffffffffffULL || ev == 0)
@@ -1056,11 +1017,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             }
 
             /* Consume the event regardless — advance past it. */
-            evq[sc->evq_read_ptr] = 0;
-            sc->evq_read_ptr =
-                (sc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                              (uint32_t)sc->evq_read_ptr);
+            evq[sc->data_evq_read_ptr] = 0;
+            sc->data_evq_read_ptr =
+                (sc->data_evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+            /* NOTE (1d barebones): the data EVQ's RPTR doorbell sits at a
+             * different per-VI offset than EVQ 0's hardcoded 0x0400. Writing
+             * 0x0400 here would corrupt the control EVQ, so we skip the
+             * doorbell for now — over a short burst the events still land and
+             * we still read them. Correct per-VI RPTR write comes with the
+             * slice/doorbell work later. */
         }
 
         /* --- Step 6: advance tx_head --- */
@@ -1094,52 +1059,35 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 
         SFC7120_LOCK(sc);
 
-        /* --- Step 1: poll EVQ for an RX event --- */
-        volatile uint64_t *evq = (volatile uint64_t *)sc->evq_ring;
+        /* --- Step 1: poll the DATA EVQ for an RX event ---
+         * Since 1c, RXQ 0 completions land in the data EVQ (instance 1). */
+        volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int    rx_found = 0;
         uint32_t rx_bytes = 0;
 
         for (int tries = 0; tries < 100000 && !rx_found; tries++) {
-            bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
-            uint64_t ev = evq[sc->evq_read_ptr];
+            uint64_t ev = evq[sc->data_evq_read_ptr];
 
             if (ev == 0xffffffffffffffffULL || ev == 0)
                 continue;
 
             uint32_t code = (uint32_t)(ev >> 60) & 0xf;
             if (code == 0) { /* RX_EV */
-                /* --- Step 2: extract byte count and descriptor index --- */
+                /* Extract byte count (includes 14-byte EF10 prefix). Trust
+                 * rx_head as the slot — same approach as Finn's ISR path. */
                 rx_bytes = (uint32_t)(ev & 0x3fff);
-                uint32_t dsc_lbits = (uint32_t)((ev >> 48) & 0xf);
-
-                /* --- Step 3: verify we are on the right slot ---
-                 * The event only carries the low 4 bits of the descriptor
-                 * index. We cross-check against the low 4 bits of rx_head
-                 * to confirm they match. If they don't, something has gone
-                 * out of sync — bail rather than copying from the wrong
-                 * slot. */
-                if ((sc->rx_head & 0xf) != dsc_lbits) {
-                    device_printf(sc->dev,
-                        "RX ioctl: dsc_lbits mismatch: event=%u rx_head=%u\n",
-                        dsc_lbits, sc->rx_head & 0xf);
-                    evq[sc->evq_read_ptr] = 0;
-                    sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
-                                       (SFC7120_NUM_EVQ_ENTRY - 1);
-                    SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                                      (uint32_t)sc->evq_read_ptr);
-                    SFC7120_UNLOCK(sc);
-                    return EIO;
-                }
                 rx_found = 1;
             }
 
             /* Consume event regardless of type. */
-            evq[sc->evq_read_ptr] = 0;
-            sc->evq_read_ptr = (sc->evq_read_ptr + 1) &
+            evq[sc->data_evq_read_ptr] = 0;
+            sc->data_evq_read_ptr = (sc->data_evq_read_ptr + 1) &
                                (SFC7120_NUM_EVQ_ENTRY - 1);
-            SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-                              (uint32_t)sc->evq_read_ptr);
+            /* NOTE (1d barebones): data EVQ's RPTR doorbell is at a different
+             * per-VI offset than EVQ 0's hardcoded 0x0400 — skip it for now to
+             * avoid corrupting the control EVQ (see TX path note above). */
         }
 
         if (!rx_found) {
@@ -1150,19 +1098,30 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         /* --- Step 4: copy packet from DMA slot to userspace ---
          * sc->rx_buffer is the virtual address the CPU uses to read the
          * DMA memory. We sync first to ensure the NIC's DMA writes are
-         * visible to the CPU, then copyout to userspace. */
+         * visible to the CPU, then strip the 14-byte EF10 prefix before
+         * copying out to userspace. */
         uint8_t *slot_va = (uint8_t *)sc->rx_buffer +
                            sc->rx_head * SFC7120_RX_BUFFER_SIZE;
 
         bus_dmamap_sync(sc->rx_buffer_dtag, sc->rx_buffer_dmamap,
                         BUS_DMASYNC_POSTREAD);
 
-        int copy_err = copyout(slot_va, req->raw_buffer, rx_bytes);
+        /* Read frame length from prefix offset +8 (LE uint16, excl. prefix).
+         * If 0, firmware was in cut-through mode — derive from event bytes. */
+        uint16_t plen = (uint16_t)slot_va[8] | ((uint16_t)slot_va[9] << 8);
+        if (plen == 0) {
+            plen = (rx_bytes > SFC7120_EF10_RX_PREFIX_LEN)
+                   ? (uint16_t)(rx_bytes - SFC7120_EF10_RX_PREFIX_LEN)
+                   : 0;
+        }
+
+        int copy_err = copyout(slot_va + SFC7120_EF10_RX_PREFIX_LEN,
+                               req->raw_buffer, plen);
         if (copy_err != 0) {
             SFC7120_UNLOCK(sc);
             return copy_err;
         }
-        req->length_received = rx_bytes;
+        req->length_received = plen;
 
         /* --- Step 5: re-post the descriptor for this slot ---
          * We just consumed the slot — write the descriptor back into the
@@ -1201,16 +1160,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 /* Interrupt handling                                                     */
 /* ---------------------------------------------------------------------- */
 
-/* EF10 event format constants. Vendored from efx_regs_ef10.h / efx_regs_mcdi.h
- * — only the fields we actually parse in the ISR. Extend as we wire up more
- * event types. */
-#define SFC7120_EV_CODE_LBN          60     /* top 4 bits of the 64-bit qword */
+/* EF10 event layout (64-bit qword). Only the fields the control ISR parses
+ * are defined here; extend as more event types are wired up. */
+#define SFC7120_EV_CODE_LBN          60     /* top 4 bits of the qword */
 #define SFC7120_EV_CODE_RX           0
 #define SFC7120_EV_CODE_TX           2
 #define SFC7120_EV_CODE_DRIVER       5
 #define SFC7120_EV_CODE_MCDI         12
 
-/* MCDI sub-event layout (bits inside the 64-bit qword). */
+/* MCDI sub-event layout (bits inside the qword). */
 #define SFC7120_MCDI_EVENT_CODE_LBN  44     /* MCDI subcode field, 8 bits */
 #define SFC7120_MCDI_EV_LINKCHANGE   0x4
 
@@ -1221,9 +1179,7 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 #define SFC7120_LC_FLAG_LINK_UP      (1u << 0)
 #define SFC7120_LC_FLAG_FDX          (1u << 1)
 
-/* EVQ_RPTR doorbell: bits 0..14 are the read-pointer (mod 2^15). sfxge
- * writes `count & ee_mask` (i.e. just the masked rptr, VLD bit clear) —
- * mirror that exactly. */
+/* EVQ_RPTR doorbell: bits 0..14 are the read-pointer (mod 2^15). */
 #define SFC7120_EVQ_RPTR_MASK        0x7fffu
 
 static uint32_t
@@ -1244,37 +1200,37 @@ sfc7120_linkchange_speed_mbps(uint32_t code)
 static void
 sfc7120_interrupt_handler(void *arg)
 {
-    sfc7120_softc_t *sc = (sfc7120_softc_t *)arg;
+    sfc7120_softc_t   *sc = (sfc7120_softc_t *)arg;
     volatile uint64_t *ring;
-    int processed = 0;
-    bool wake_rx_task = false;
+    int                processed = 0;
 
+    /* Safe-to-run latch: bail if the control EVQ isn't up yet or we're
+     * tearing down. An MSI-X vector can fire the instant it's wired (before
+     * INIT_EVQ) or during detach; these checks keep those harmless. */
     if (sc == NULL || sc->evq_ring == NULL)
         return;
     if (sc->dying || !sc->evq_initialized)
         return;
 
-    ring = (volatile uint64_t *)sc->evq_ring;
+    ring = (volatile uint64_t *)sc->evq_ring;   /* EVQ 0 = control queue */
 
     SFC7120_LOCK(sc);
 
-    /* Sync the EVQ for CPU reads — NIC writes events via DMA. The buffer
-     * is BUS_DMA_COHERENT so this is a barrier hint, not a cache flush. */
+    /* NIC writes events via DMA; sync for CPU reads (BUS_DMA_COHERENT, so
+     * this is a barrier hint rather than a cache flush). */
     bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
                     BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
     for (;;) {
         uint64_t ev = ring[sc->evq_read_ptr];
-        uint32_t lo = (uint32_t)(ev & 0xffffffffu);
-        uint32_t hi = (uint32_t)(ev >> 32);
 
-        /* Presence: hardware fills slots with all-ones at init; we clear
-         * to all-zeros on consume. Both patterns mean "not a real event"
-         * — see EFX_EV_PRESENT in efx_ev.c. */
-        if ((lo == 0xffffffffu && hi == 0xffffffffu) ||
-            (lo == 0 && hi == 0))
+        /* Slots are 0xff-primed at alloc and zeroed on consume; either
+         * pattern means "no event present". */
+        if (ev == 0xffffffffffffffffULL || ev == 0)
             break;
 
+        uint32_t lo   = (uint32_t)(ev & 0xffffffffu);
+        uint32_t hi   = (uint32_t)(ev >> 32);
         uint32_t code = (hi >> (SFC7120_EV_CODE_LBN - 32)) & 0xfu;
 
         switch (code) {
@@ -1287,18 +1243,16 @@ sfc7120_interrupt_handler(void *arg)
                 uint32_t fcntl = (lo >> SFC7120_LC_FCNTL_SHIFT) & 0xfu;
                 bool up  = (flags & SFC7120_LC_FLAG_LINK_UP) != 0;
                 bool fdx = (flags & SFC7120_LC_FLAG_FDX) != 0;
-                uint32_t mbps = sfc7120_linkchange_speed_mbps(scode);
 
                 sc->link_up         = up;
                 sc->full_duplex     = fdx;
-                sc->link_speed_mbps = mbps;
+                sc->link_speed_mbps = sfc7120_linkchange_speed_mbps(scode);
                 sc->link_fcntl      = fcntl;
 
                 device_printf(sc->dev,
                     "EVQ LINKCHANGE: link=%s speed=%u Mbps %s fcntl=%u "
-                    "flags=%#x\n",
-                    up ? "UP" : "DOWN", mbps, fdx ? "FDX" : "HDX",
-                    fcntl, flags);
+                    "flags=%#x\n", up ? "UP" : "DOWN", sc->link_speed_mbps,
+                    fdx ? "FDX" : "HDX", fcntl, flags);
             } else {
                 device_printf(sc->dev,
                     "EVQ MCDI_EV: subcode=%#x ev=%#016jx\n",
@@ -1310,63 +1264,20 @@ sfc7120_interrupt_handler(void *arg)
             device_printf(sc->dev, "EVQ DRIVER_EV: %#016jx\n",
                           (uintmax_t)ev);
             break;
-        case SFC7120_EV_CODE_RX: {
-            /* ESF_DZ_RX_BYTES: LBN=0 WIDTH=14 — byte count including the
-             * 14-byte EF10 prefix (FLAG_PREFIX was set in INIT_RXQ flags). */
-            uint32_t rbytes = lo & 0x3fffu;
-            /* Publish the completion under rx_mtx so the SFC7120_RX
-             * consumer reads bytes and head under the same lock that
-             * ordered the producer's writes.  Lock order sc_mtx → rx_mtx
-             * matches: no other site nests them the other way. */
-            mtx_lock(&sc->rx_mtx);
-            int slot = sc->rx_head;
-            sc->rx_event_bytes_ring[slot] = (uint16_t)rbytes;
-            sc->rx_head = (slot + 1) & (SFC7120_NUM_RX_DESC - 1);
-            mtx_unlock(&sc->rx_mtx);
-            device_printf(sc->dev,
-                "EVQ RX_EV: bytes=%u slot=%d\n", rbytes, slot);
-            wake_rx_task = true;
-            break;
-        }
-        case SFC7120_EV_CODE_TX: {
-            /* ESF_DZ_TX_DESCR_INDX: LBN=0 WIDTH=16 — index of the last TX
-             * descriptor completed by the NIC. */
-            uint32_t descr_indx = lo & 0xffffu;
-            int new_head = ((int)descr_indx + 1) & (SFC7120_NUM_TX_DESC - 1);
-            /* Credit back descriptors between tx_head and new_head (wrap-safe). */
-            int freed = (new_head - sc->tx_head + SFC7120_NUM_TX_DESC)
-                        & (SFC7120_NUM_TX_DESC - 1);
-            if (freed == 0)
-                freed = 1; /* single-descriptor batch always frees one */
-            sc->tx_head = new_head;
-            sc->tx_descriptors_free += freed;
-            if (sc->tx_descriptors_free > SFC7120_NUM_TX_DESC)
-                sc->tx_descriptors_free = SFC7120_NUM_TX_DESC;
-            device_printf(sc->dev,
-                "EVQ TX_EV: descr_indx=%u new_head=%d freed=%d free_now=%d\n",
-                descr_indx, new_head, freed, sc->tx_descriptors_free);
-            break;
-        }
         default:
-            device_printf(sc->dev,
-                "EVQ unknown code=%#x ev=%#016jx\n",
-                code, (uintmax_t)ev);
+            /* RX(0)/TX(2) must never land here — they target the data EVQ.
+             * If one does, the 1c retarget regressed. */
+            device_printf(sc->dev, "EVQ0 event: code=%#x raw=%#016jx\n",
+                          code, (uintmax_t)ev);
             break;
         }
 
-        /* Mark slot consumed. Next pass sees all-zeros = "not present"
-         * until the NIC overwrites with a fresh event. */
         ring[sc->evq_read_ptr] = 0;
         sc->evq_read_ptr =
             (sc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-        processed++;
-
-        if (processed >= SFC7120_NUM_EVQ_ENTRY) {
-            /* Defensive: if a bug ever produces a wraparound full of
-             * "present" markers we don't want to spin forever in the
-             * ISR. */
+        if (++processed >= SFC7120_NUM_EVQ_ENTRY) {
             device_printf(sc->dev,
-                "EVQ: processed full ring without empty marker\n");
+                "EVQ0: processed full ring without empty marker\n");
             break;
         }
     }
@@ -1374,66 +1285,43 @@ sfc7120_interrupt_handler(void *arg)
     if (processed > 0) {
         bus_dmamap_sync(sc->evq_dtag, sc->evq_dmamap,
                         BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+        /* EVQ 0's RPTR doorbell IS the hardcoded 0x0400 — correct for the
+         * control queue (the per-VI offset issue only affects EVQ 1). */
         SFC7120_WRITE_REG(sc, SFC7120_REG_EVQ_RPTR_DBL,
-            (uint32_t)sc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
+                          (uint32_t)sc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
     }
 
     SFC7120_UNLOCK(sc);
-
-    if (wake_rx_task && sc->rx_taskqueue != NULL)
-        taskqueue_enqueue(sc->rx_taskqueue, &sc->rx_task);
 }
 
 static void
 sfc7120_rx_task_handler(void *context, int pending)
 {
     sfc7120_softc_t *sc = (sfc7120_softc_t *)context;
-    /* The ring (rx_head vs rx_completion_tail) is the readiness predicate
-     * now — the ISR has already advanced rx_head before enqueueing us.
-     * We just wake any sleeping consumers; they re-check the predicate
-     * under rx_mtx. */
     SFC7120_RX_LOCK(sc);
-    wakeup(sc);                   /* wake SFC7120_RX msleep() callers */
+    sc->rx_received = true;
     selwakeuppri(&sc->selinfo, PZERO + 1);
     SFC7120_RX_UNLOCK(sc);
 }
 
 /* ---------------------------------------------------------------------- */
-/* MSI-X allocation / teardown                                            */
+/* MSI-X interrupt setup / teardown (control EVQ 0)                       */
 /* ---------------------------------------------------------------------- */
 
 static int
 sfc7120_intr_setup(sfc7120_softc_t *sc)
 {
     device_t dev = sc->dev;
-    int count;
-    int error;
-
-    /* Initialize the RX taskqueue + task. The ISR enqueues rx_task on
-     * RX_EV; rx_task_handler signals waiting selrecord/poll consumers. */
-    TASK_INIT(&sc->rx_task, 0, sfc7120_rx_task_handler, sc);
-    sc->rx_taskqueue = taskqueue_create("sfc7120_rx", M_WAITOK,
-        taskqueue_thread_enqueue, &sc->rx_taskqueue);
-    if (sc->rx_taskqueue == NULL) {
-        device_printf(dev, "intr_setup: taskqueue_create failed\n");
-        return ENOMEM;
-    }
-    error = taskqueue_start_threads(&sc->rx_taskqueue, 1, PI_NET,
-        "%s rx", device_get_nameunit(dev));
-    if (error != 0) {
-        device_printf(dev,
-            "intr_setup: taskqueue_start_threads failed: %d\n", error);
-        goto fail_tq;
-    }
+    int      count;
+    int      error;
 
     /* MSI-X table + PBA live in BAR4 on EF10 (16 KB on SFN7322F-R2,
-     * `Table in map 0x20[0x0], PBA in map 0x20[0x2000]` per pciconf -lbv).
+     * "Table in map 0x20[0x0], PBA in map 0x20[0x2000]" per pciconf -lbv).
      * Mirror sfxge_intr_setup_msix: allocate the BAR, then ask for vectors. */
     count = pci_msix_count(dev);
     if (count <= 0) {
         device_printf(dev, "intr_setup: MSI-X unavailable\n");
-        error = ENXIO;
-        goto fail_tq;
+        return ENXIO;
     }
 
     sc->msix_bar_rid = PCIR_BAR(4);
@@ -1441,17 +1329,15 @@ sfc7120_intr_setup(sfc7120_softc_t *sc)
         &sc->msix_bar_rid, RF_ACTIVE);
     if (sc->msix_bar_resource == NULL) {
         device_printf(dev, "intr_setup: BAR4 alloc failed\n");
-        error = ENOMEM;
-        goto fail_tq;
+        return ENOMEM;
     }
 
-    /* Single vector for the single EVQ we currently program. Multi-vector
-     * lands when multi-EVQ does. */
+    /* One vector for the single interrupting (control) EVQ. Multi-vector
+     * arrives when multi-EVQ does. */
     count = 1;
     error = pci_alloc_msix(dev, &count);
     if (error != 0) {
-        device_printf(dev,
-            "intr_setup: pci_alloc_msix failed: %d\n", error);
+        device_printf(dev, "intr_setup: pci_alloc_msix failed: %d\n", error);
         goto fail_bar;
     }
     if (count != 1) {
@@ -1462,8 +1348,7 @@ sfc7120_intr_setup(sfc7120_softc_t *sc)
     }
     sc->msix_nvec = count;
 
-    /* RID 1 = first MSI-X vector (RID 0 is reserved for INTx). Not
-     * RF_SHAREABLE — MSI-X vectors are per-handler. */
+    /* RID 1 = first MSI-X vector (RID 0 is reserved for legacy INTx). */
     sc->irq_res_id = 1;
     sc->irq_resource = bus_alloc_resource_any(dev, SYS_RES_IRQ,
         &sc->irq_res_id, RF_ACTIVE);
@@ -1473,13 +1358,13 @@ sfc7120_intr_setup(sfc7120_softc_t *sc)
         goto fail_msi;
     }
 
-    /* No filter — sfxge runs MSI-X in ithread context directly. */
+    /* NULL filter: run the handler directly in ithread context, as sfxge
+     * does for MSI-X. */
     error = bus_setup_intr(dev, sc->irq_resource,
         INTR_TYPE_NET | INTR_MPSAFE, NULL,
         sfc7120_interrupt_handler, sc, &sc->irq_handle);
     if (error != 0) {
-        device_printf(dev,
-            "intr_setup: bus_setup_intr failed: %d\n", error);
+        device_printf(dev, "intr_setup: bus_setup_intr failed: %d\n", error);
         goto fail_irq;
     }
 
@@ -1498,11 +1383,6 @@ fail_bar:
     bus_release_resource(dev, SYS_RES_MEMORY, sc->msix_bar_rid,
                          sc->msix_bar_resource);
     sc->msix_bar_resource = NULL;
-fail_tq:
-    if (sc->rx_taskqueue != NULL) {
-        taskqueue_free(sc->rx_taskqueue);
-        sc->rx_taskqueue = NULL;
-    }
     return error;
 }
 
@@ -1511,15 +1391,9 @@ sfc7120_intr_teardown(sfc7120_softc_t *sc)
 {
     device_t dev = sc->dev;
 
-    /* Order: drain taskqueue first (any RX_EV-enqueued task could still
-     * be in-flight), then tear down the ISR (guarantees no further
-     * enqueues), then release MSI/BAR. Mirror of mlx5pol's detach. */
-    if (sc->rx_taskqueue != NULL) {
-        taskqueue_drain(sc->rx_taskqueue, &sc->rx_task);
-        taskqueue_free(sc->rx_taskqueue);
-        sc->rx_taskqueue = NULL;
-    }
-
+    /* Tear down the ISR first (bus_teardown_intr waits for any in-flight
+     * handler and guarantees no further fires), then release the IRQ,
+     * MSI-X vectors, and BAR4. Reverse of sfc7120_intr_setup. */
     if (sc->intr_initialized && sc->irq_resource != NULL &&
         sc->irq_handle != NULL) {
         bus_teardown_intr(dev, sc->irq_resource, sc->irq_handle);

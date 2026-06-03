@@ -32,7 +32,7 @@
 
 /* Per-VI doorbells for function-local VI 0.
  * Formula: reg_offset + (vi_local_index << vi_window_shift)
- * Huntington uses EFX_VI_WINDOW_SHIFT_8K (shift=13, stride=8192).  For VI 0
+ * Huntington uses EFX_VI_WINDOW_SHIFT_8K (shift=13, stride=8192). For VI 0
  * the shift term is 0, so these match the base offsets exactly.
  * Confirmed from efx_regs_ef10.h: ER_DZ_EVQ_RPTR_REG_OFST,
  * ER_DZ_RX_DESC_UPD_REG_OFST, ER_DZ_TX_DESC_UPD_REG_OFST. */
@@ -41,7 +41,7 @@
 #define SFC7120_REG_TX_DESC_DBL     0x0a10  /* 128-bit TX_DESC_UPD base (full push) */
 /* TX write-pointer-only doorbell: EFX_BAR_VI_WRITED2 adds 8 bytes (2 dwords)
  * to the base, landing on dword[2] which holds ERF_DZ_TX_DESC_WPTR (LBN=64,
- * WIDTH=12 of the 128-bit register).  See ef10_tx.c:ef10_tx_qpush. */
+ * WIDTH=12 of the 128-bit register). See ef10_tx.c:ef10_tx_qpush. */
 #define SFC7120_REG_TX_WPTR_DBL     (SFC7120_REG_TX_DESC_DBL + 8)  /* 0x0a18 */
 
 /* Boot/identity registers.

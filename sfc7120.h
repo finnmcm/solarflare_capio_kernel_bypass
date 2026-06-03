@@ -54,69 +54,6 @@
  * be added later by extending the region enum and softc.
  */
 
-/* EF10 requires each descriptor ring to be at least one full 4K page. With
- * 8-byte descriptors that's 512 entries minimum — anything smaller makes
- * INIT_RXQ/INIT_TXQ EINVAL. */
-#define SFC7120_NUM_TX_DESC    512
-#define SFC7120_NUM_RX_DESC    512
-#define SFC7120_NUM_EVQ_ENTRY  512
-#define SFC7120_TX_BUFFER_SIZE 2048
-#define SFC7120_RX_BUFFER_SIZE 2048
-
-#define SFC7120_EVQ_ENTRY_SIZE 8        /* EF10 events are 64-bit */
-#define SFC7120_TX_DESC_SIZE   8        /* 8-byte TX descriptor */
-#define SFC7120_RX_DESC_SIZE   8        /* 8-byte RX descriptor */
-
-typedef enum {
-    SFC7120_TX_BUFFER,
-    SFC7120_RX_BUFFER,
-    SFC7120_MMIO_REGION,
-    SFC7120_REGION_COUNT      /* keep last */
-} sfc7120_vm_map_type_t;
-
-/* User-facing IOCTL request structs.
- * Every CAPIO IOCTL struct MUST begin with user_cap + sealed_cap so that
- * capio_ioctl_handler can validate the token at offset 0. */
-
-typedef struct sfc7120_mac_req {
-    void* __capability user_cap;
-    void* __capability sealed_cap;
-
-    uint8_t mac_addr[6];
-} sfc7120_mac_req_t;
-
-typedef struct sfc7120_tx_req {
-    void* __capability user_cap;
-    void* __capability sealed_cap;
-
-    uint8_t* __capability tx_buf_addr;
-    size_t  length;
-    uint8_t status;
-} sfc7120_tx_req_t;
-
-/*
- * RX ioctl request.  Kept deliberately small: the whole received frame lands
- * in the single contiguous raw_buffer (one 2048-byte RX slot holds an entire
- * <=1518-byte frame), so no scatter/gather descriptor list is needed.
- *
- * NOTE: do NOT embed a large inline array here.  _IOWR's length field is only
- * 13 bits (IOCPARM_MAX = 8192); a struct over that wraps its encoded length and
- * kern_ioctl then copies far fewer bytes than the driver writes back -> kernel
- * stack overflow.  If genuine multi-segment RX is ever needed, add a *pointer*
- * to a userspace-allocated descriptor array (see e1000 rx_req_t), never an
- * inline array.
- */
-typedef struct sfc7120_rx_req {
-    void* __capability user_cap;
-    void* __capability sealed_cap;
-
-    uint8_t *raw_buffer;
-    size_t   length_received;
-
-    uint8_t  status;
-    uint8_t  error;
-} sfc7120_rx_req_t;
-
 /* Per-buffer metadata, mirrors the e1000 pattern. */
 typedef struct sfc7120_rx_buf_info {
     uint8_t   *buf;
@@ -151,9 +88,9 @@ typedef struct sfc7120_softc {
     uint8_t             mac_addr[6];
 
     /* Interrupt resources (MSI-X is the EF10 norm; legacy fallback omitted).
-     * BAR4 backs the MSI-X table + PBA (16 KB on SFN7322F-R2). We allocate it
-     * explicitly so the kernel can map the table, then ask for one MSI-X
-     * vector at RID 1. */
+     * BAR4 backs the MSI-X table + PBA (16 KB on SFN7322F-R2); we allocate it
+     * so the kernel can map the table, then ask for one MSI-X vector. The ISR
+     * (Phase 2) attaches to that vector and services the control EVQ (0). */
     struct resource    *msix_bar_resource;
     int                 msix_bar_rid;
     int                 msix_nvec;
@@ -162,12 +99,21 @@ typedef struct sfc7120_softc {
     void               *irq_handle;
     bool                intr_initialized;
 
-    /* Event queue (EVQ) — DMA buffer of 64-bit events */
+    /* Control EVQ (instance 0) — DMA buffer of 64-bit events. Interrupting;
+     * carries link/MCDI/error events. The ISR will own this in Phase 2. */
     void               *evq_ring;
     bus_addr_t          evq_ring_paddr;
     bus_dma_tag_t       evq_dtag;
     bus_dmamap_t        evq_dmamap;
     int                 evq_read_ptr;
+
+    /* Data EVQ (instance 1) — non-interrupting; carries TX/RX completions.
+     * The inline TX/RX poll loops read this queue. */
+    void               *data_evq_ring;
+    bus_addr_t          data_evq_ring_paddr;
+    bus_dma_tag_t       data_evq_dtag;
+    bus_dmamap_t        data_evq_dmamap;
+    int                 data_evq_read_ptr;
 
     /* TX resources */
     void               *tx_desc_ring;
@@ -185,6 +131,7 @@ typedef struct sfc7120_softc {
     int                 tx_descriptors_free;
 
     /* RX resources */
+    volatile bool       rx_received;
     volatile bool       rx_teardown;
     struct task         rx_task;
     struct taskqueue   *rx_taskqueue;
@@ -202,23 +149,12 @@ typedef struct sfc7120_softc {
     bus_dma_tag_t       rx_buffer_dtag;
     bus_dmamap_t        rx_buffer_dmamap;
     bool                rx_buffer_mapped;
-    /* RX completion SPSC ring (producer = ISR, consumer = SFC7120_RX ioctl).
-     * Both indices and the per-slot bytes array are governed by rx_mtx.
-     * Empty <=> rx_completion_tail == rx_head. */
-    int                 rx_head;           /* producer: ISR advances on RX_EV */
-    int                 rx_completion_tail;/* consumer: ioctl advances on read */
-    uint16_t            rx_event_bytes_ring[SFC7120_NUM_RX_DESC];
-    int                 rx_pushed;         /* un-masked producer counter for wptr guard */
+    int                 rx_head;
 
     /* Lifecycle */
     bool                device_attached;
     struct cdev        *cdev;
     struct mtx          sc_mtx;
-    /* Serializes TX ioctl submitters end-to-end (reserve → copyin → publish
-     * → doorbell) so the descriptor ring is written in reserve order even
-     * when copyin page-faults.  ISR does NOT take this lock — it can credit
-     * TX completions while a submitter is in copyin. */
-    struct mtx          tx_submit_mtx;
     bool                dying;
     bool                mapped;
 
@@ -254,37 +190,34 @@ typedef struct sfc7120_softc {
     uint32_t            fw_version[2];    /* hi/lo pair */
     bool                drv_attached;
     bool                vis_allocated;
-    bool                evq_initialized;
+    bool                evq_initialized;       /* control EVQ 0 */
+    bool                data_evq_initialized;  /* data EVQ 1 */
 
     /* vadaptor, tx/rx init flags */
     bool vadaptor_allocated;
     bool rxq_initialized;
     bool txq_initialized;
 
-    /* RX filter (MC_CMD_FILTER_OP). Inserted after INIT_RXQ so matching RX
-     * frames are steered to RX queue 0; the firmware-returned 64-bit handle
-     * is needed to remove it on teardown. */
-    uint64_t rx_filter_handle;
-    bool     rx_filter_inserted;
-
-    /* PHY supported-capabilities mask harvested from MC_CMD_GET_PHY_CFG.
-     * Used as the SET_LINK advertisement mask. The MC firmware doesn't
-     * report the *_FEC_REQUESTED bits — we OR them in manually post-read
-     * to mirror sfxge ef10_nic.c:1869-1877. */
+    /* PHY capability cache — populated by sfc7120_mcdi_get_phy_cfg. */
     uint32_t            phy_supported_cap_mask;
     uint32_t            phy_adv_cap_mask;
     uint32_t            phy_media_type;
 
-    /* Link state populated by MC_CMD_GET_LINK. Updated by the
-     * post-SET_LINK poll in hw_init today, and (eventually) by the EVQ
-     * event handler when interrupts are wired. */
+    /* Link state — updated by sfc7120_mcdi_get_link. */
     bool                link_up;
     bool                full_duplex;
     uint32_t            link_speed_mbps;
     uint32_t            link_fcntl;
 
+    /* Bringup completion flags. */
     bool                mac_configured;
     bool                link_configured;
+
+    /* RX filter (MC_CMD_FILTER_OP). Inserted after INIT_RXQ so matching RX
+     * frames are steered to RX queue 0. The firmware-returned 64-bit handle
+     * is needed to remove the filter on teardown. */
+    uint64_t            rx_filter_handle;
+    bool                rx_filter_inserted;
 
     bool                debug_reg_ops;
 } sfc7120_softc_t;

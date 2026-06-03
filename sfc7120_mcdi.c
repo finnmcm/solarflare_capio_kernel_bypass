@@ -213,43 +213,6 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_VADAPTOR_FREE_IN_UPSTREAM_PORT_ID_OFST   0
 #define MC_CMD_VADAPTOR_FREE_OUT_LEN                    0
 
-/* MC_CMD_FILTER_OP (0x8a) — RX/TX filter insert/remove. The base msgrequest
- * is 108 bytes (EXT_IN is 172, V3_IN 180; sfxge sends V3, but Huntington fw
- * accepts the base layout). Opcode >= 0x80, so sfc7120_mcdi_exec auto-selects
- * v2 framing — do not special-case it.
- *
- * CRITICAL: the match VALUE fields (MACs, ports, ethertype) go on the wire in
- * NETWORK (big-endian) byte order, unlike every other MCDI field — see the
- * memcpy in sfc7120_mcdi_filter_insert and ef10_filter.c. The dword fields
- * below (OP / PORT_ID / MATCH_FIELDS / RX_* / TX_DEST) are ordinary
- * little-endian MCDI integers. */
-#define MC_CMD_FILTER_OP                                0x8a
-#define MC_CMD_FILTER_OP_IN_LEN                         108
-#define MC_CMD_FILTER_OP_IN_OP_OFST                      0
-#define MC_CMD_FILTER_OP_IN_OP_INSERT                   0x0
-#define MC_CMD_FILTER_OP_IN_OP_REMOVE                   0x1
-#define MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST               4
-#define MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST               8
-#define MC_CMD_FILTER_OP_IN_PORT_ID_OFST                12
-#define MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST           16
-#define MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN            4
-#define MC_CMD_FILTER_OP_IN_MATCH_UNKNOWN_UCAST_DST_LBN 31
-#define MC_CMD_FILTER_OP_IN_RX_DEST_OFST                20
-#define MC_CMD_FILTER_OP_IN_RX_DEST_HOST                0x1
-#define MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST               24
-#define MC_CMD_FILTER_OP_IN_RX_MODE_OFST                28
-#define MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE             0x0
-#define MC_CMD_FILTER_OP_IN_TX_DEST_OFST                40
-#define MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT     0xffffffffu
-#define MC_CMD_FILTER_OP_IN_DST_MAC_OFST                52
-#define MC_CMD_FILTER_OP_IN_DST_MAC_LEN                  6
-
-#define MC_CMD_FILTER_OP_OUT_LEN                        12
-#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST              4
-#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST              8
-#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID  0xffffffffu
-#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID  0xffffffffu
-
 #define MC_CMD_GET_CAPABILITIES           0xbe
 #define MC_CMD_GET_CAPABILITIES_OUT_LEN   20
 #define MC_CMD_GET_CAPABILITIES_OUT_FLAGS1_OFST 0
@@ -257,73 +220,6 @@ __FBSDID("$FreeBSD$");
 #define MC_CMD_GET_CAPABILITIES_OUT_TX_DPCPU_FW_ID_OFST 6 /* 2 bytes */
 #define MC_CMD_GET_CAPABILITIES_OUT_HW_CAPS_OFST 12 /* 4 bytes */
 #define MC_CMD_GET_CAPABILITIES_OUT_LICENSE_CAPS_OFST 16 /* 4 bytes */
-
-/* MC_CMD_GET_PHY_CFG (0x24) — no IN payload; OUT layout per
- * ref_efx_regs_mcdi.h. Only the fields we actually consume are named. */
-#define MC_CMD_GET_PHY_CFG                0x24
-#define MC_CMD_GET_PHY_CFG_OUT_LEN        72
-#define MC_CMD_GET_PHY_CFG_OUT_SUPPORTED_CAP_OFST 8
-#define MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST    44
-
-/* MC_CMD_SET_MAC (0x2c), v1 framing — 28-byte IN, no OUT. */
-#define MC_CMD_SET_MAC                    0x2c
-#define MC_CMD_SET_MAC_IN_LEN             28
-#define MC_CMD_SET_MAC_IN_MTU_OFST         0
-#define MC_CMD_SET_MAC_IN_DRAIN_OFST       4
-#define MC_CMD_SET_MAC_IN_ADDR_OFST        8   /* 8-byte slot, low 6 = MAC */
-#define MC_CMD_SET_MAC_IN_REJECT_OFST     16
-#define MC_CMD_SET_MAC_IN_FCNTL_OFST      20
-#define MC_CMD_SET_MAC_IN_FLAGS_OFST      24
-
-/* FCNTL enum (shared with MC_CMD_GET_LINK_OUT/FCNTL). */
-#define MC_CMD_FCNTL_OFF                  0x0
-#define MC_CMD_FCNTL_RESPOND              0x1
-#define MC_CMD_FCNTL_BIDIR                0x2
-#define MC_CMD_FCNTL_AUTO                 0x3
-#define MC_CMD_FCNTL_GENERATE             0x5
-
-/* MTU value sfxge programs at first bringup:
- *   EFX_MAC_PDU(sdu) = roundup(sdu + 38, 8)
- *   where 38 = EtherII(14) + VLAN(4) + CRC(4) + bug16011 pad(16).
- * For default 1500 SDU that yields 1544. */
-#define SFC7120_DEFAULT_MAC_PDU           1544u
-
-/* MC_CMD_SET_LINK (0x2a) — 16-byte IN, no OUT. */
-#define MC_CMD_SET_LINK                   0x2a
-#define MC_CMD_SET_LINK_IN_LEN            16
-#define MC_CMD_SET_LINK_IN_CAP_OFST        0
-#define MC_CMD_SET_LINK_IN_FLAGS_OFST      4
-#define MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST  8
-#define MC_CMD_SET_LINK_IN_LOOPBACK_SPEED_OFST 12
-
-#define MC_CMD_LOOPBACK_NONE              0x0
-
-/* PHY capability bit positions used to build the SET_LINK CAP mask
- * (also reported in GET_LINK_OUT/CAP). Names mirror sfxge. */
-#define MC_CMD_PHY_CAP_AN_LBN              10
-#define MC_CMD_PHY_CAP_BASER_FEC_LBN       16
-#define MC_CMD_PHY_CAP_BASER_FEC_REQUESTED_LBN 17
-#define MC_CMD_PHY_CAP_RS_FEC_LBN          18
-#define MC_CMD_PHY_CAP_RS_FEC_REQUESTED_LBN 19
-#define MC_CMD_PHY_CAP_25G_BASER_FEC_LBN   20
-#define MC_CMD_PHY_CAP_25G_BASER_FEC_REQUESTED_LBN 21
-
-/* MC_CMD_GET_LINK (0x29) — no IN; v1 OUT is 28 bytes, v2 is 44 bytes. */
-#define MC_CMD_GET_LINK                   0x29
-#define MC_CMD_GET_LINK_OUT_LEN           28
-#define MC_CMD_GET_LINK_OUT_V2_LEN        44
-#define MC_CMD_GET_LINK_OUT_CAP_OFST       0
-#define MC_CMD_GET_LINK_OUT_LP_CAP_OFST    4
-#define MC_CMD_GET_LINK_OUT_LINK_SPEED_OFST 8
-#define MC_CMD_GET_LINK_OUT_LOOPBACK_MODE_OFST 12
-#define MC_CMD_GET_LINK_OUT_FLAGS_OFST    16
-#define MC_CMD_GET_LINK_OUT_FCNTL_OFST    20
-#define MC_CMD_GET_LINK_OUT_MAC_FAULT_OFST 24
-
-#define MC_CMD_GET_LINK_OUT_LINK_UP_LBN      0
-#define MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN  1
-#define MC_CMD_GET_LINK_OUT_LINK_FAULT_RX_LBN 6
-#define MC_CMD_GET_LINK_OUT_LINK_FAULT_TX_LBN 7
 
 /* Polling parameters. Mirrors EF10_MCDI_CMD_TIMEOUT_US in sfxge. */
 #define SFC7120_MCDI_POLL_MIN_US         10
@@ -1229,24 +1125,25 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
      *     command as long as the flag is set; nothing will actually fire
      *     into a vector until we wire up bus_setup_intr later.
      * Bits: INTERRUPTING=0, CUT_THRU=3, RX_MERGE=4, TX_MERGE=5. */
+    /* EVQ 0 is the interrupting "control" queue; every other EVQ (e.g. the
+     * data queue at index 1) is non-interrupting. */
+    bool interrupting = (instance == 0);
+
     uint32_t flags = (1u << 3) | (1u << 4) | (1u << 5);
-    
-    // ARTHUR : this flag apparently tells our NIC to fire an interrupt every time we post an event to this ring
-    // this means that a cable being plugged correctly recognizes a CABLE_LINK event, however 
-    // it also means that incoming packet events trigger interrupts which is botched and will probably cause a race condition 
-    // with our user level approach to dumping the data events 
-    // TLDR we need to seperate the control event queue from the data event queue so we only scan the control queue for interrupts. 
-    if (instance == 0)
+    if (interrupting)
         flags |= (1u << 0);
 
     uint8_t buf[MC_CMD_INIT_EVQ_IN_LEN(1)] = {0};
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_SIZE_OFST)     = nevs;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_INSTANCE_OFST) = instance;
     *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_FLAGS_OFST)    = flags;
-    /* IRQ_NUM (offset 24, unioned with TARGET_EVQ): function-relative
-     * vector for interrupting EVQs. For index 0 with INTERRUPTING set,
-     * sfxge writes irq=index (i.e. 0); we mirror that. */
-    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST) = instance;
+    /* IRQ_NUM (offset 24, unioned with TARGET_EVQ): for an interrupting EVQ
+     * this is the function-relative MSI-X vector; for a non-interrupting EVQ
+     * it must name an interrupting EVQ to ride for wake-ups. sfxge uses the
+     * always-interrupting index 0, so: vector=instance if interrupting, else
+     * 0. (Both resolve to 0 today since EVQ 0 is our only interrupting one.) */
+    *(uint32_t *)(buf + MC_CMD_INIT_EVQ_IN_TARGET_EVQ_OFST) =
+        interrupting ? instance : 0;
     *(uint64_t *)(buf + MC_CMD_INIT_EVQ_IN_DMA_ADDR_OFST) = paddr;
 
     device_printf(sc->dev,
@@ -1262,11 +1159,9 @@ sfc7120_mcdi_init_evq(sfc7120_softc_t *sc, uint32_t instance,
       *(uint32_t *)(buf + 40),
       (uintmax_t)paddr, (uintmax_t)(paddr & 0xfff));
 
-    /* OUT.IRQ at offset 0 is documented but NOT populated by firmware on
-     * this card — sfxge explicitly ignores it (ef10_ev.c:255: "ignore the
-     * returned IRQ param as firmware does not set it"). Anything we'd
-     * read there is stale mailbox content. Still ask for OUT_LEN bytes so
-     * we get a length-sanity check inside exec, but discard the value. */
+    /* OUT carries the IRQ number when FLAG_INTERRUPTING is set; we don't
+     * set it yet (MSI-X not wired). Allocate and zero it anyway so exec
+     * has a non-NULL response sink. */
     uint32_t out = 0;
     size_t   out_used = 0;
 
@@ -1456,7 +1351,12 @@ sfc7120_mcdi_init_txq(sfc7120_softc_t *sc, uint32_t instance,
 int
 sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance)
 {
-    if (!sc->evq_initialized)
+    /* Each EVQ tracks its own init state. A single shared flag would let the
+     * first fini() call clear it and make the second early-return — leaving
+     * one EVQ initialized in firmware across unload (EALREADY on reload). */
+    bool *donep = (instance == 0) ? &sc->evq_initialized
+                                  : &sc->data_evq_initialized;
+    if (!*donep)
         return 0;
 
     uint8_t buf[MC_CMD_FINI_EVQ_IN_LEN] = {0};
@@ -1471,7 +1371,7 @@ sfc7120_mcdi_fini_evq(sfc7120_softc_t *sc, uint32_t instance)
         if (rc == EBUSY)
             return rc;
     }
-    sc->evq_initialized = false;
+    *donep = false;
     return rc;
 }
 
@@ -1566,122 +1466,6 @@ sfc7120_mcdi_vadaptor_free(sfc7120_softc_t *sc)
 }
 
 int
-sfc7120_mcdi_filter_insert(sfc7120_softc_t *sc)
-{
-    if (sc->rx_filter_inserted)
-        return 0;
-
-    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN]   = {0};
-    uint8_t  resp[MC_CMD_FILTER_OP_OUT_LEN] = {0};
-    size_t   used = 0;
-    uint32_t match;
-    uint32_t handle_lo, handle_hi;
-    int      rc;
-
-    /*
-     * First filter for the port-to-port loopback bridge: match RX frames
-     * whose destination MAC equals this port's MAC and steer them to RX
-     * queue 0. The userspace bridge TXes with dst = the peer port's MAC, so
-     * an exact DST_MAC filter on each PF catches the bridged unicast traffic.
-     *
-     * Promiscuous fallback (not used here): drop the DST_MAC match and set
-     * MATCH_UNKNOWN_UCAST_DST (LBN 31) instead, with no DST_MAC value — that
-     * receives all unicast not claimed by a more specific filter, useful if
-     * the bridge doesn't rewrite destination MACs.
-     */
-    match = (1u << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN);
-
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
-        MC_CMD_FILTER_OP_IN_OP_INSERT;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_PORT_ID_OFST) =
-        EVB_PORT_ID_ASSIGNED;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST) = match;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_DEST_OFST) =
-        MC_CMD_FILTER_OP_IN_RX_DEST_HOST;
-    /* RX_QUEUE is the function-local RX queue index (matches our
-     * init_rxq(instance=0)), NOT the absolute vi_base. */
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST) = 0;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_MODE_OFST) =
-        MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_TX_DEST_OFST) =
-        MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT;
-
-    /*
-     * NOTE: unlike every other MCDI field, filter match VALUES go on the wire
-     * in network (big-endian) byte order. sc->mac_addr is already in network
-     * order, so it is memcpy'd as-is (mirrors sfxge ef10_filter.c
-     * efx_mcdi_filter_op_add). The dword fields set above are ordinary
-     * little-endian MCDI integers.
-     */
-    memcpy(buf + MC_CMD_FILTER_OP_IN_DST_MAC_OFST, sc->mac_addr,
-           MC_CMD_FILTER_OP_IN_DST_MAC_LEN);
-
-    /* Opcode 0x8a >= 0x80 → exec auto-selects v2 framing. IN_LEN=108 is
-     * dword-aligned; no alignment check needed (and per CLAUDE.md "quirks"
-     * must never be added). If a future fw rejects the base layout with
-     * EINVAL, resend with EXT_IN (172, zero-padded) — sfxge sends V3_IN. */
-    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
-                           buf, sizeof(buf), resp, sizeof(resp), &used);
-    if (rc != 0) {
-        device_printf(sc->dev, "MCDI FILTER_OP(INSERT) failed: %d\n", rc);
-        return rc;
-    }
-    if (used < MC_CMD_FILTER_OP_OUT_LEN) {
-        device_printf(sc->dev,
-            "MCDI FILTER_OP(INSERT): short response (%zu bytes)\n", used);
-        return EPROTO;
-    }
-
-    /* exec already le32toh'd each response dword, so resp holds native
-     * integers — no further byte-swap (mirrors alloc_vis / get_link). */
-    memcpy(&handle_lo, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST], 4);
-    memcpy(&handle_hi, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST], 4);
-
-    if (handle_lo == MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID &&
-        handle_hi == MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID) {
-        device_printf(sc->dev,
-            "MCDI FILTER_OP(INSERT): firmware returned invalid handle\n");
-        return EIO;
-    }
-
-    sc->rx_filter_handle =
-        ((uint64_t)handle_hi << 32) | (uint64_t)handle_lo;
-    sc->rx_filter_inserted = true;
-    device_printf(sc->dev,
-        "MC FILTER_OP: inserted handle=0x%016jx (dst_mac match -> rxq 0)\n",
-        (uintmax_t)sc->rx_filter_handle);
-    return 0;
-}
-
-int
-sfc7120_mcdi_filter_remove(sfc7120_softc_t *sc)
-{
-    if (!sc->rx_filter_inserted)
-        return 0;
-
-    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN] = {0};
-    uint32_t handle_lo = (uint32_t)(sc->rx_filter_handle & 0xffffffffu);
-    uint32_t handle_hi = (uint32_t)(sc->rx_filter_handle >> 32);
-    int      rc;
-
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
-        MC_CMD_FILTER_OP_IN_OP_REMOVE;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST) = handle_lo;
-    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST) = handle_hi;
-
-    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
-                           buf, sizeof(buf), NULL, 0, NULL);
-    if (rc != 0) {
-        device_printf(sc->dev, "MCDI FILTER_OP(REMOVE) failed: %d\n", rc);
-        /* Clear the flag anyway — after an MC reboot / ENTITY_RESET the
-         * firmware has already dropped the filter, and repeating REMOVE on a
-         * stale handle is unsafe. */
-    }
-    sc->rx_filter_inserted = false;
-    return rc;
-}
-
-int
 sfc7120_mcdi_get_mac(sfc7120_softc_t *sc)
 {
     uint8_t resp[MC_CMD_GET_MAC_ADDRESSES_OUT_LEN] = {0};
@@ -1760,15 +1544,57 @@ sfc7120_mcdi_free_vis(sfc7120_softc_t *sc)
 }
 
 /* ---------------------------------------------------------------------- */
-/* MAC / PHY / link bring-up. Issued from sfc7120_hw_init after the       */
-/* vAdaptor is allocated. Without these the MAC stays drained and the PHY */
-/* never negotiates a link, so no frames cross the wire even though the   */
-/* host-side queues are programmed.                                       */
-/*                                                                        */
-/* Reference: sfxge ef10_mac_reconfigure (ef10_mac.c:292-368),            */
-/* ef10_phy_reconfigure (ef10_phy.c:356-516), and ef10_phy_get_link       */
-/* (ef10_phy.c:284-353).                                                  */
+/* MAC / PHY / link bring-up                                              */
 /* ---------------------------------------------------------------------- */
+
+/* MC_CMD_GET_PHY_CFG (0x24) */
+#define MC_CMD_GET_PHY_CFG                0x24
+#define MC_CMD_GET_PHY_CFG_OUT_LEN        72
+#define MC_CMD_GET_PHY_CFG_OUT_SUPPORTED_CAP_OFST 8
+#define MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST    44
+
+/* MC_CMD_SET_MAC (0x2c) — v1 framing, 28-byte IN, no OUT */
+#define MC_CMD_SET_MAC                    0x2c
+#define MC_CMD_SET_MAC_IN_LEN             28
+#define MC_CMD_SET_MAC_IN_MTU_OFST         0
+#define MC_CMD_SET_MAC_IN_DRAIN_OFST       4
+#define MC_CMD_SET_MAC_IN_ADDR_OFST        8
+#define MC_CMD_SET_MAC_IN_REJECT_OFST     16
+#define MC_CMD_SET_MAC_IN_FCNTL_OFST      20
+#define MC_CMD_SET_MAC_IN_FLAGS_OFST      24
+
+#define MC_CMD_FCNTL_AUTO                 0x3
+/* MTU = EFX_MAC_PDU(1500) = roundup(1500+38, 8) = 1544 */
+#define SFC7120_DEFAULT_MAC_PDU           1544u
+
+/* MC_CMD_SET_LINK (0x2a) — 16-byte IN, no OUT */
+#define MC_CMD_SET_LINK                   0x2a
+#define MC_CMD_SET_LINK_IN_LEN            16
+#define MC_CMD_SET_LINK_IN_CAP_OFST        0
+#define MC_CMD_SET_LINK_IN_FLAGS_OFST      4
+#define MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST  8
+#define MC_CMD_SET_LINK_IN_LOOPBACK_SPEED_OFST 12
+#define MC_CMD_LOOPBACK_NONE              0x0
+
+/* PHY capability bit positions */
+#define MC_CMD_PHY_CAP_AN_LBN              10
+#define MC_CMD_PHY_CAP_BASER_FEC_LBN       16
+#define MC_CMD_PHY_CAP_BASER_FEC_REQUESTED_LBN 17
+#define MC_CMD_PHY_CAP_RS_FEC_LBN          18
+#define MC_CMD_PHY_CAP_RS_FEC_REQUESTED_LBN 19
+#define MC_CMD_PHY_CAP_25G_BASER_FEC_LBN   20
+#define MC_CMD_PHY_CAP_25G_BASER_FEC_REQUESTED_LBN 21
+
+/* MC_CMD_GET_LINK (0x29) — no IN; OUT is 28 bytes (v1) or 44 bytes (v2) */
+#define MC_CMD_GET_LINK                   0x29
+#define MC_CMD_GET_LINK_OUT_LEN           28
+#define MC_CMD_GET_LINK_OUT_V2_LEN        44
+#define MC_CMD_GET_LINK_OUT_LINK_SPEED_OFST  8
+#define MC_CMD_GET_LINK_OUT_FLAGS_OFST       16
+#define MC_CMD_GET_LINK_OUT_FCNTL_OFST       20
+#define MC_CMD_GET_LINK_OUT_MAC_FAULT_OFST   24
+#define MC_CMD_GET_LINK_OUT_LINK_UP_LBN      0
+#define MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN  1
 
 int
 sfc7120_mcdi_get_phy_cfg(sfc7120_softc_t *sc)
@@ -1796,10 +1622,8 @@ sfc7120_mcdi_get_phy_cfg(sfc7120_softc_t *sc)
     memcpy(&media_type,
            &resp[MC_CMD_GET_PHY_CFG_OUT_MEDIA_TYPE_OFST], 4);
 
-    /* FEC quirk: firmware reports the *_FEC capability bits but omits the
-     * companion *_FEC_REQUESTED bits even when the PMD requires FEC. sfxge
-     * patches them in here so SET_LINK actually requests FEC on PMDs that
-     * need it (ef10_nic.c:1869-1877). */
+    /* FEC quirk: firmware omits the *_FEC_REQUESTED bits even when the PMD
+     * requires FEC. sfxge patches them in here (ef10_nic.c:1869-1877). */
     if (supported_cap & (1u << MC_CMD_PHY_CAP_BASER_FEC_LBN))
         supported_cap |= (1u << MC_CMD_PHY_CAP_BASER_FEC_REQUESTED_LBN);
     if (supported_cap & (1u << MC_CMD_PHY_CAP_RS_FEC_LBN))
@@ -1820,29 +1644,20 @@ int
 sfc7120_mcdi_set_mac(sfc7120_softc_t *sc)
 {
     uint8_t  buf[MC_CMD_SET_MAC_IN_LEN] = {0};
-    uint32_t mtu = SFC7120_DEFAULT_MAC_PDU;
-    uint32_t drain = 0;
-    uint32_t reject = 0;
-    uint32_t fcntl = MC_CMD_FCNTL_AUTO;
-    uint32_t flags = 0;
     int      rc;
 
-    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_MTU_OFST)    = mtu;
-    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_DRAIN_OFST)  = drain;
-    /* ADDR is an 8-byte slot; only the low 6 bytes carry the MAC, the high
-     * 2 are zero (sfxge writes via an 8-byte EFX_MAC_ADDR_COPY that pads
-     * the top with zero — same effect). */
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_MTU_OFST)    = SFC7120_DEFAULT_MAC_PDU;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_DRAIN_OFST)  = 0;
     memcpy(buf + MC_CMD_SET_MAC_IN_ADDR_OFST, sc->mac_addr, 6);
-    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_REJECT_OFST) = reject;
-    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FCNTL_OFST)  = fcntl;
-    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FLAGS_OFST)  = flags;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_REJECT_OFST) = 0;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FCNTL_OFST)  = MC_CMD_FCNTL_AUTO;
+    *(uint32_t *)(buf + MC_CMD_SET_MAC_IN_FLAGS_OFST)  = 0;
 
     rc = sfc7120_mcdi_exec(sc, MC_CMD_SET_MAC,
                            buf, sizeof(buf), NULL, 0, NULL);
     if (rc == EACCES) {
         /* Unprivileged functions can't reconfigure the MAC. sfxge swallows
-         * this and lets filter setup proceed; do the same so a non-TRUSTED
-         * function still attaches. */
+         * this; do the same so a non-TRUSTED function still attaches. */
         device_printf(sc->dev,
             "MC SET_MAC: EACCES (unprivileged), continuing\n");
         return 0;
@@ -1856,7 +1671,8 @@ sfc7120_mcdi_set_mac(sfc7120_softc_t *sc)
     device_printf(sc->dev,
         "MC SET_MAC: addr=%02x:%02x:%02x:%02x:%02x:%02x mtu=%u fcntl=AUTO\n",
         sc->mac_addr[0], sc->mac_addr[1], sc->mac_addr[2],
-        sc->mac_addr[3], sc->mac_addr[4], sc->mac_addr[5], mtu);
+        sc->mac_addr[3], sc->mac_addr[4], sc->mac_addr[5],
+        SFC7120_DEFAULT_MAC_PDU);
     return 0;
 }
 
@@ -1867,17 +1683,12 @@ sfc7120_mcdi_set_link(sfc7120_softc_t *sc)
     uint32_t cap;
     int      rc;
 
-    /* Advertise everything the PHY supports. Ensure the AN bit is set so
-     * the firmware actually runs auto-negotiation with the link partner;
-     * GET_PHY_CFG normally reports AN as supported on EF10, but be defensive
-     * (sfxge does the same OR-in implicitly via its ep_adv_cap_mask seed). */
     cap = sc->phy_supported_cap_mask | (1u << MC_CMD_PHY_CAP_AN_LBN);
     sc->phy_adv_cap_mask = cap;
 
-    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_CAP_OFST)            = cap;
-    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_FLAGS_OFST)          = 0;
-    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST)  =
-        MC_CMD_LOOPBACK_NONE;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_CAP_OFST)           = cap;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_FLAGS_OFST)         = 0;
+    *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_LOOPBACK_MODE_OFST) = MC_CMD_LOOPBACK_NONE;
     *(uint32_t *)(buf + MC_CMD_SET_LINK_IN_LOOPBACK_SPEED_OFST) = 0;
 
     rc = sfc7120_mcdi_exec(sc, MC_CMD_SET_LINK,
@@ -1920,11 +1731,10 @@ sfc7120_mcdi_get_link(sfc7120_softc_t *sc)
     memcpy(&fcntl,      &resp[MC_CMD_GET_LINK_OUT_FCNTL_OFST],      4);
     memcpy(&mac_fault,  &resp[MC_CMD_GET_LINK_OUT_MAC_FAULT_OFST],  4);
 
-    sc->link_up = (link_flags & (1u << MC_CMD_GET_LINK_OUT_LINK_UP_LBN)) != 0;
-    sc->full_duplex =
-        (link_flags & (1u << MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN)) != 0;
+    sc->link_up         = (link_flags & (1u << MC_CMD_GET_LINK_OUT_LINK_UP_LBN)) != 0;
+    sc->full_duplex     = (link_flags & (1u << MC_CMD_GET_LINK_OUT_FULL_DUPLEX_LBN)) != 0;
     sc->link_speed_mbps = link_speed;
-    sc->link_fcntl = fcntl;
+    sc->link_fcntl      = fcntl;
 
     device_printf(sc->dev,
         "MC GET_LINK: speed=%u Mbps link=%s%s fcntl=%u mac_fault=%#x\n",
@@ -1933,4 +1743,132 @@ sfc7120_mcdi_get_link(sfc7120_softc_t *sc)
         sc->full_duplex ? " FDX" : "",
         fcntl, mac_fault);
     return 0;
+}
+
+/* MC_CMD_FILTER_OP (0x8a) — RX/TX filter insert/remove.
+ *
+ * Opcode >= 0x80 → exec auto-selects v2 framing.
+ *
+ * CRITICAL: filter match VALUE fields (MACs, ports, ethertype) go on the wire
+ * in NETWORK (big-endian) byte order, unlike every other MCDI field.
+ * sc->mac_addr is already in network order, so it is memcpy'd as-is.
+ * Dword control fields (OP, PORT_ID, MATCH_FIELDS, RX_*, TX_DEST) are
+ * ordinary little-endian MCDI integers — mirrors sfxge ef10_filter.c. */
+#define MC_CMD_FILTER_OP                                0x8a
+#define MC_CMD_FILTER_OP_IN_LEN                         108
+#define MC_CMD_FILTER_OP_IN_OP_OFST                      0
+#define MC_CMD_FILTER_OP_IN_OP_INSERT                   0x0
+#define MC_CMD_FILTER_OP_IN_OP_REMOVE                   0x1
+#define MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST               4
+#define MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST               8
+#define MC_CMD_FILTER_OP_IN_PORT_ID_OFST                12
+#define MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST           16
+#define MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN            4
+#define MC_CMD_FILTER_OP_IN_RX_DEST_OFST                20
+#define MC_CMD_FILTER_OP_IN_RX_DEST_HOST                0x1
+#define MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST               24
+#define MC_CMD_FILTER_OP_IN_RX_MODE_OFST                28
+#define MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE             0x0
+#define MC_CMD_FILTER_OP_IN_TX_DEST_OFST                40
+#define MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT     0xffffffffu
+#define MC_CMD_FILTER_OP_IN_DST_MAC_OFST                52
+#define MC_CMD_FILTER_OP_IN_DST_MAC_LEN                  6
+
+#define MC_CMD_FILTER_OP_OUT_LEN                        12
+#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST              4
+#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST              8
+#define MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID  0xffffffffu
+#define MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID  0xffffffffu
+
+int
+sfc7120_mcdi_filter_insert(sfc7120_softc_t *sc)
+{
+    if (sc->rx_filter_inserted)
+        return 0;
+
+    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN]   = {0};
+    uint8_t  resp[MC_CMD_FILTER_OP_OUT_LEN] = {0};
+    size_t   used = 0;
+    uint32_t handle_lo, handle_hi;
+    int      rc;
+
+    /* Match RX frames whose destination MAC equals this port's MAC and steer
+     * them to RX queue 0.  An exact DST_MAC filter catches the unicast traffic
+     * addressed to us; promiscuous mode (MATCH_UNKNOWN_UCAST_DST) is not needed
+     * for the loopback bridge use-case. */
+    uint32_t match = (1u << MC_CMD_FILTER_OP_IN_MATCH_DST_MAC_LBN);
+
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
+        MC_CMD_FILTER_OP_IN_OP_INSERT;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_PORT_ID_OFST) =
+        EVB_PORT_ID_ASSIGNED;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_MATCH_FIELDS_OFST) = match;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_DEST_OFST) =
+        MC_CMD_FILTER_OP_IN_RX_DEST_HOST;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_QUEUE_OFST) = 0;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_RX_MODE_OFST) =
+        MC_CMD_FILTER_OP_IN_RX_MODE_SIMPLE;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_TX_DEST_OFST) =
+        MC_CMD_FILTER_OP_IN_TX_DEST_DEFAULT;
+
+    /* MAC goes in network byte order — sc->mac_addr is already big-endian. */
+    memcpy(buf + MC_CMD_FILTER_OP_IN_DST_MAC_OFST, sc->mac_addr,
+           MC_CMD_FILTER_OP_IN_DST_MAC_LEN);
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
+                           buf, sizeof(buf), resp, sizeof(resp), &used);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FILTER_OP(INSERT) failed: %d\n", rc);
+        return rc;
+    }
+    if (used < MC_CMD_FILTER_OP_OUT_LEN) {
+        device_printf(sc->dev,
+            "MCDI FILTER_OP(INSERT): short response (%zu bytes)\n", used);
+        return EPROTO;
+    }
+
+    memcpy(&handle_lo, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_LO_OFST], 4);
+    memcpy(&handle_hi, &resp[MC_CMD_FILTER_OP_OUT_HANDLE_HI_OFST], 4);
+
+    if (handle_lo == MC_CMD_FILTER_OP_OUT_HANDLE_LO_INVALID &&
+        handle_hi == MC_CMD_FILTER_OP_OUT_HANDLE_HI_INVALID) {
+        device_printf(sc->dev,
+            "MCDI FILTER_OP(INSERT): firmware returned invalid handle\n");
+        return EIO;
+    }
+
+    sc->rx_filter_handle = ((uint64_t)handle_hi << 32) | (uint64_t)handle_lo;
+    sc->rx_filter_inserted = true;
+    device_printf(sc->dev,
+        "MC FILTER_OP: inserted handle=0x%016jx (dst_mac -> rxq 0)\n",
+        (uintmax_t)sc->rx_filter_handle);
+    return 0;
+}
+
+int
+sfc7120_mcdi_filter_remove(sfc7120_softc_t *sc)
+{
+    if (!sc->rx_filter_inserted)
+        return 0;
+
+    uint8_t  buf[MC_CMD_FILTER_OP_IN_LEN] = {0};
+    uint32_t handle_lo = (uint32_t)(sc->rx_filter_handle & 0xffffffffu);
+    uint32_t handle_hi = (uint32_t)(sc->rx_filter_handle >> 32);
+    int      rc;
+
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_OP_OFST) =
+        MC_CMD_FILTER_OP_IN_OP_REMOVE;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_LO_OFST) = handle_lo;
+    *(uint32_t *)(buf + MC_CMD_FILTER_OP_IN_HANDLE_HI_OFST) = handle_hi;
+
+    rc = sfc7120_mcdi_exec(sc, MC_CMD_FILTER_OP,
+                           buf, sizeof(buf), NULL, 0, NULL);
+    if (rc != 0) {
+        device_printf(sc->dev, "MCDI FILTER_OP(REMOVE) failed: %d\n", rc);
+        /* Clear the flag anyway — after an MC reboot / ENTITY_RESET the
+         * firmware has already dropped the filter and a stale handle is unsafe
+         * to reuse. */
+    }
+    sc->rx_filter_inserted = false;
+    return rc;
 }

@@ -60,7 +60,6 @@ core
 test.mk
 test_*.mk
 bsd-xargs
-usertest/sfc7120_test
 
 # Compressed files (if you archive builds)
 *.tar
@@ -78,4 +77,3 @@ compile_commands.json
 
 .cache/
 scratch_notes.md
-handoff.md
