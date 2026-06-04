@@ -22,9 +22,12 @@
 
 /* Memory region indices — must match sfc7120_vm_map_type_t in sfc7120.h. */
 typedef enum {
-    SFC7120_TX_BUFFER,
-    SFC7120_RX_BUFFER,
-    SFC7120_MMIO_REGION,
+    SFC7120_TX_BUFFER,        /* 0 — DMA TX packet buffer (1 MB) */
+    SFC7120_RX_BUFFER,        /* 1 — DMA RX packet buffer (1 MB) */
+    SFC7120_MMIO_REGION,      /* 2 — BAR2, sliced per-register */
+    SFC7120_TX_DESC_RING,     /* 3 — TX descriptor ring (4 KB) */
+    SFC7120_RX_DESC_RING,     /* 4 — RX descriptor ring (4 KB) */
+    SFC7120_EVQ_RING,         /* 5 — data EVQ ring, instance 1 (4 KB) */
     SFC7120_REGION_COUNT
 } sfc7120_vm_map_type_t;
 
@@ -67,9 +70,38 @@ typedef struct sfc7120_rx_req {
     uint8_t error;
 } sfc7120_rx_req_t;
 
+/*
+ * sfc7120_vi_info_req_t — VI geometry handed to userspace for the direct
+ * (phase C+) data path, following ef_vi's resource-manager model. The kernel
+ * fills the DMA bus addresses, VI base, queue instance numbers, ring counts,
+ * and current head pointers so the process can drive the rings itself. All
+ * plain scalars — no inline arrays — so it stays well under IOCPARM_MAX.
+ */
+typedef struct sfc7120_vi_info_req {
+    void * __capability user_cap;
+    void * __capability sealed_cap;
+
+    uint64_t tx_buffer_paddr;   /* bus addr of TX packet buffer slot 0 */
+    uint64_t rx_buffer_paddr;   /* bus addr of RX packet buffer slot 0 */
+
+    uint32_t vi_base;           /* absolute base VI for this function */
+    uint32_t evq_instance;      /* data EVQ instance (1) */
+    uint32_t rxq_instance;      /* RXQ instance (0) */
+    uint32_t txq_instance;      /* TXQ instance (0) */
+
+    uint32_t num_tx_desc;       /* 512 */
+    uint32_t num_rx_desc;       /* 512 */
+    uint32_t num_evq_entry;     /* 512 */
+
+    uint32_t tx_head;           /* current kernel TX producer index */
+    uint32_t rx_head;           /* current kernel RX post index */
+    uint32_t evq_read_ptr;      /* current data-EVQ read pointer */
+} sfc7120_vi_info_req_t;
+
 /* IOCTLs — 'S' group matches the kernel definition. */
-#define SFC7120_RX      _IOWR('S', 1, sfc7120_rx_req_t)
-#define SFC7120_TX      _IOWR('S', 2, sfc7120_tx_req_t)
-#define SFC7120_GET_MAC _IOWR('S', 3, sfc7120_mac_req_t)
+#define SFC7120_RX          _IOWR('S', 1, sfc7120_rx_req_t)
+#define SFC7120_TX          _IOWR('S', 2, sfc7120_tx_req_t)
+#define SFC7120_GET_MAC     _IOWR('S', 3, sfc7120_mac_req_t)
+#define SFC7120_GET_VI_INFO _IOWR('S', 4, sfc7120_vi_info_req_t)
 
 #endif /* SFC7120_UAPI_H */

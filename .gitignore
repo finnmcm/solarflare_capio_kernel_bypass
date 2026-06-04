@@ -77,3 +77,6 @@ compile_commands.json
 
 .cache/
 scratch_notes.md
+
+# Personal work log (not for the repo)
+userlib/LOG.md

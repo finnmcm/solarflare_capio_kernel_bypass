@@ -125,6 +125,12 @@ sfc7120_get_buffer_size(void *arg, int type)
         buffer_size = rman_get_size(sc->mem_resource);
         SFC7120_UNLOCK(sc);
         return buffer_size;
+    case SFC7120_TX_DESC_RING:
+        return SFC7120_NUM_TX_DESC * SFC7120_TX_DESC_SIZE;
+    case SFC7120_RX_DESC_RING:
+        return SFC7120_NUM_RX_DESC * SFC7120_RX_DESC_SIZE;
+    case SFC7120_EVQ_RING:
+        return SFC7120_NUM_EVQ_ENTRY * SFC7120_EVQ_ENTRY_SIZE;
     default:
         return 0;
     }
@@ -724,33 +730,33 @@ sfc7120_fbsd_attach(device_t dev)
     sc->smem[SFC7120_MMIO_REGION].slice_definitions = sfc7120_reg_slices;
     sc->smem[SFC7120_MMIO_REGION].slice_def_len     = SFC7120_MMIO_SLICE_COUNT;
 
-    /* EVQ ring is intentionally NOT registered in smem[] yet.
-     *
-     * Current approach (barebones / phase 1): TX and RX are driven through
-     * the SFC7120_TX / SFC7120_RX ioctls. The kernel walks the EVQ, processes
-     * completions, and copies data to/from userspace. The kernel stays in the
-     * data path. This is enough to prove correctness and get traffic flowing.
-     *
-     * Arthur: i'm going to start building out the user library under the above approach until ioctl infra built out finn 
-     *
-     * End goal (direct path / phase 2): remove the kernel from the data path
-     * entirely. Userspace gets a CHERI capability to the EVQ ring and polls
-     * it directly — each slot is 8 bytes, bit 63 is the valid marker (ring is
-     * pre-filled 0xff at alloc; the NIC clears bit 63 when it writes a real
-     * event). TX completions arrive as EV_CODE_TX_EV (code=2) events carrying
-     * the completed descriptor index. RX arrivals arrive as EV_CODE_RX_EV
-     * (code=0) events carrying byte count and descriptor pointer bits.
-     * After consuming an event, userspace writes the consumed index back to
-     * the EVQ read-pointer doorbell (SFC7120_REG_EVQ_RPTR_DBL) to free the
-     * slot — no syscall. TX sends follow the same pattern: userspace writes
-     * a descriptor into the TX ring and rings the TX doorbell register
-     * (SFC7120_REG_TX_DESC_DBL) directly through the MMIO slice.
-     *
-     * To enable phase 2: add SFC7120_EVQ_RING to sfc7120_vm_map_type_t in
-     * sfc7120_uapi.h, bump SFC7120_REGION_COUNT, populate smem[] here
-     * (is_physical=false, addr=sc->evq_ring, len=NUM_EVQ_ENTRY*EVQ_ENTRY_SIZE,
-     * is_sliced=false), and add SFC7120_REG_EVQ_RPTR_DBL to the MMIO slice
-     * manifest so userspace can ack events without a syscall. */
+    /* Data-path rings (phase A): expose the TX/RX descriptor rings and the
+     * data EVQ ring (instance 1) so userspace can poll and post directly in
+     * later phases. All three are kernel-VA DMA allocations, not sliced. The
+     * EVQ region is sc->data_evq_ring (the non-interrupting data EVQ), NOT the
+     * kernel-owned control EVQ 0. Userspace still drives TX/RX through the
+     * SFC7120_TX / SFC7120_RX ioctls until the direct path lands; mapping these
+     * regions does not by itself remove the kernel from the data path. */
+    sc->smem[SFC7120_TX_DESC_RING].type        = SFC7120_TX_DESC_RING;
+    sc->smem[SFC7120_TX_DESC_RING].is_physical = false;
+    sc->smem[SFC7120_TX_DESC_RING].addr        = sc->tx_desc_ring;
+    sc->smem[SFC7120_TX_DESC_RING].len         =
+        SFC7120_NUM_TX_DESC * SFC7120_TX_DESC_SIZE;
+    sc->smem[SFC7120_TX_DESC_RING].is_sliced   = false;
+
+    sc->smem[SFC7120_RX_DESC_RING].type        = SFC7120_RX_DESC_RING;
+    sc->smem[SFC7120_RX_DESC_RING].is_physical = false;
+    sc->smem[SFC7120_RX_DESC_RING].addr        = sc->rx_desc_ring;
+    sc->smem[SFC7120_RX_DESC_RING].len         =
+        SFC7120_NUM_RX_DESC * SFC7120_RX_DESC_SIZE;
+    sc->smem[SFC7120_RX_DESC_RING].is_sliced   = false;
+
+    sc->smem[SFC7120_EVQ_RING].type        = SFC7120_EVQ_RING;
+    sc->smem[SFC7120_EVQ_RING].is_physical = false;
+    sc->smem[SFC7120_EVQ_RING].addr        = sc->data_evq_ring;
+    sc->smem[SFC7120_EVQ_RING].len         =
+        SFC7120_NUM_EVQ_ENTRY * SFC7120_EVQ_ENTRY_SIZE;
+    sc->smem[SFC7120_EVQ_RING].is_sliced   = false;
 
     device_printf(dev, "TRACE: smem populated\n");
 
@@ -905,6 +911,32 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         sfc7120_mac_req_t *req = (sfc7120_mac_req_t *)data;
         SFC7120_LOCK(sc);
         memcpy(req->mac_addr, sc->mac_addr, sizeof(req->mac_addr));
+        SFC7120_UNLOCK(sc);
+        return 0;
+    }
+    case SFC7120_GET_VI_INFO: {
+        /*
+         * Hand userspace the VI geometry it needs to drive the rings
+         * directly (phase C+). The CAPIO framework has already validated
+         * user_cap/sealed_cap before dispatch, so no extra token check is
+         * needed here (same as GET_MAC). Instance numbers are
+         * function-relative and match the init_evq/rxq/txq calls in
+         * sfc7120_hw_init: data EVQ = 1, RXQ = 0, TXQ = 0.
+         */
+        sfc7120_vi_info_req_t *req = (sfc7120_vi_info_req_t *)data;
+        SFC7120_LOCK(sc);
+        req->tx_buffer_paddr = sc->tx_buffer_paddr;
+        req->rx_buffer_paddr = sc->rx_buffer_paddr;
+        req->vi_base         = sc->vi_base;
+        req->evq_instance    = 1;
+        req->rxq_instance    = 0;
+        req->txq_instance    = 0;
+        req->num_tx_desc     = SFC7120_NUM_TX_DESC;
+        req->num_rx_desc     = SFC7120_NUM_RX_DESC;
+        req->num_evq_entry   = SFC7120_NUM_EVQ_ENTRY;
+        req->tx_head         = sc->tx_head;
+        req->rx_head         = sc->rx_head;
+        req->evq_read_ptr    = sc->data_evq_read_ptr;
         SFC7120_UNLOCK(sc);
         return 0;
     }
