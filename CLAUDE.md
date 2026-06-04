@@ -614,23 +614,21 @@ following the mlx5pol per-queue pattern.
 | 1 | `SFC7120_RX_BUFFER` | false | 64 × 2048 = 128 KB | No | DMA RX packet buffer (kernel VA) |
 | 2 | `SFC7120_MMIO_REGION` | true | BAR0 size | Yes | NIC register space (BAR0 physical addr) |
 
-The MMIO slice manifest (`sfc7120_reg_slices[]`) starts with the registers
-a CAPIO userspace driver minimally needs:
+The MMIO slice manifest (`sfc7120_reg_slices[]`) exposes the data-path
+doorbells at their **absolute per-VI window offsets** (`base +
+(instance << 13)`; data EVQ = instance 1, RXQ/TXQ = instance 0 — see
+`SFC7120_REG_DATA_*` in `sfc7120_mmio.h`):
 
-| Register | Direction | Notes |
-|---|---|---|
-| `MC_DOORBELL` (`0x0e80`) | RW | Kicks MCDI requests |
-| `MC_EVENT`   (`0x0e84`) | RO | MC status |
-| `EVQ_RPTR_DBL` (`0x0500`) | RW | Ack events |
-| `RX_DESC_DBL`  (`0x0510`) | RW | Push RX descriptor producer pointer |
-| `TX_DESC_DBL`  (`0x0518`) | RW | Push TX descriptor producer pointer |
-| `HW_REV_ID`    (`0x0010`) | RO | Sanity check at attach |
-| `MC_STATUS`    (`0x0c7c`) | RO | Health |
+| Register | Offset | Direction | Notes |
+|---|---|---|---|
+| `MC_DOORBELL` | `0x0200` | RW | Kicks MCDI requests (low word) |
+| `DATA_EVQ_RPTR_DBL` | `0x2400` | RW | Ack data-EVQ (instance 1) events |
+| `RX_DESC_DBL` | `0x0830` | RW | Push RX descriptor producer pointer |
+| `TX_DESC_DBL` | `0x0a10` (12 B) | RW | TX push; `+8` = WPTR-only |
+| `HW_REV_ID` | `0x0000` | RO | Sanity check at attach |
 
-**These offsets are placeholders.** Cross-check against the EF10 register
-documentation for your specific SFN7xxx board (and against the FreeBSD
-`sfxge` driver in `~/cheri/cheribsd/sys/dev/sfxge/`) before treating them
-as authoritative.
+The control EVQ 0 RPTR (`0x0400`) is deliberately **not** exposed — EVQ 0
+is kernel-owned. Corrected + hardware-verified 2026-06-03 (Phase B).
 
 ---
 
@@ -642,7 +640,7 @@ as authoritative.
 | Attach ordering | Done | BAR alloc → hw_init → DMA alloc → make_dev_capio → smem populate → init_capio_sc → vm_object_handle alloc — all observed in the dmesg trace. |
 | Detach ordering | Done | dying flag → free handles → modmap_unregister → destroy_dev → free DMA → hw_teardown → release BAR → capio_destroy → destroy locks |
 | `capio_ops_t` vtable | Done | `ioctl`, `get_buffer_size`, `is_dying` all wired |
-| Slice manifest | Skeleton | 7 entries; extend for multi-queue |
+| Slice manifest | Done (single-queue) | Data-path doorbells at per-VI window offsets (data-EVQ RPTR = `0x2400`); control EVQ 0 RPTR not exposed. Verified on hardware 2026-06-03. Extend for multi-queue. |
 | Cdev (`/dev/sfc7120pol`) | Done | open/close/poll/ioctl wired |
 | MCDI transport (v1 + v2) | Done | `sfc7120_mcdi.c`. Mailbox alloc, framing, exec wrapper, error xlate. **Do not break v2 framing** — see "MCDI v1/v2 framing trap" above. |
 | MCDI identity bringup | Done | `GET_VERSION`, `DRV_ATTACH`, `GET_MAC`, `GET_PORT_ASSIGNMENT`, `GET_FUNCTION_INFO`, `GET_CAPABILITIES`, `GET_ASSERTS`. Populates `sc->mac_addr`. |
@@ -773,10 +771,12 @@ Confirm against the actual board with `pciconf -lv` and adjust
   Defined but not called. Decide: keep as a recovery utility, or
   delete. Removing requires no callers; keep if you anticipate needing
   to recover from MC reboot mid-run.
-- **Slice manifest offsets are placeholders.** Confirm the doorbell /
-  ring-pointer offsets against the EF10 register layout in sfxge before
-  exposing them to userspace. Wrong offsets here become a CHERI bounds
-  violation at the userspace driver, not a kernel panic — easy to miss.
+- ~~Slice manifest offsets are placeholders~~ **Resolved 2026-06-03
+  (Phase B):** data-path doorbell slices corrected to absolute per-VI
+  window offsets (`SFC7120_REG_DATA_*` in `sfc7120_mmio.h`), and the
+  TX/RX ioctl handlers now ack the data EVQ on its instance-1 RPTR
+  doorbell (`0x2400`) — previously skipped, which would have backed up
+  the EVQ on long runs. Hardware-verified via `sfctest`.
 - **No in-tree copy.** Add `~/cheri/cheribsd/sys/modules/sfc7120pol/`
   with VPATH-shared `capio.c` once driver stabilizes.
 - **No userspace driver.** `userlib/sfc7120_user.c` is in progress — hand-rolled packets, no lwIP.

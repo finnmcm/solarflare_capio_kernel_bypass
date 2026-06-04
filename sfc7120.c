@@ -389,7 +389,7 @@ sfc7120_post_rx_buffers(sfc7120_softc_t *sc)
                     BUS_DMASYNC_PREWRITE);
 
     /* Tell the NIC: slots 0..(npost-1) are ready. */
-    SFC7120_WRITE_REG(sc, SFC7120_REG_RX_DESC_DBL, (uint32_t)npost);
+    SFC7120_WRITE_REG(sc, SFC7120_REG_DATA_RX_DESC_DBL, (uint32_t)npost);
     sc->rx_head = 0;
 
     device_printf(sc->dev, "RX: posted %d buffer descriptors\n", npost);
@@ -928,9 +928,9 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         req->tx_buffer_paddr = sc->tx_buffer_paddr;
         req->rx_buffer_paddr = sc->rx_buffer_paddr;
         req->vi_base         = sc->vi_base;
-        req->evq_instance    = 1;
-        req->rxq_instance    = 0;
-        req->txq_instance    = 0;
+        req->evq_instance    = SFC7120_DATA_EVQ_INSTANCE;
+        req->rxq_instance    = SFC7120_RXQ_INSTANCE;
+        req->txq_instance    = SFC7120_TXQ_INSTANCE;
         req->num_tx_desc     = SFC7120_NUM_TX_DESC;
         req->num_rx_desc     = SFC7120_NUM_RX_DESC;
         req->num_evq_entry   = SFC7120_NUM_EVQ_ENTRY;
@@ -1018,7 +1018,7 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          * ERF_DZ_TX_DESC_WPTR lives at dword[2] (LBN=64) of TX_DESC_UPD.
          * Write to TX_WPTR_DBL = TX_DESC_DBL + 8 = 0x0a18. */
         uint32_t wptr = (uint32_t)(sc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
-        SFC7120_WRITE_REG(sc, SFC7120_REG_TX_WPTR_DBL, wptr);
+        SFC7120_WRITE_REG(sc, SFC7120_REG_DATA_TX_WPTR_DBL, wptr);
 
         /* --- Step 5: poll EVQ for TX completion ---
          * The NIC posts an 8-byte TX_EV event to the EVQ when it finishes
@@ -1031,6 +1031,7 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          * we poll data_evq_ring — not the control EVQ. */
         volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int tx_done = 0;
+        int consumed = 0;
         for (int tries = 0; tries < 10000 && !tx_done; tries++) {
             bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
@@ -1052,12 +1053,18 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             evq[sc->data_evq_read_ptr] = 0;
             sc->data_evq_read_ptr =
                 (sc->data_evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-            /* NOTE (1d barebones): the data EVQ's RPTR doorbell sits at a
-             * different per-VI offset than EVQ 0's hardcoded 0x0400. Writing
-             * 0x0400 here would corrupt the control EVQ, so we skip the
-             * doorbell for now — over a short burst the events still land and
-             * we still read them. Correct per-VI RPTR write comes with the
-             * slice/doorbell work later. */
+            consumed++;
+        }
+
+        /* Ack consumed events on the DATA EVQ's own RPTR doorbell — at the
+         * instance-1 window offset (0x2400), NOT EVQ 0's 0x0400. Mirrors the
+         * control-EVQ ack in the ISR. Without this the NIC eventually sees
+         * the EVQ as full and stops posting completions. */
+        if (consumed > 0) {
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
+                            BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+            SFC7120_WRITE_REG(sc, SFC7120_REG_DATA_EVQ_RPTR_DBL,
+                (uint32_t)sc->data_evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
         }
 
         /* --- Step 6: advance tx_head --- */
@@ -1095,6 +1102,7 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
          * Since 1c, RXQ 0 completions land in the data EVQ (instance 1). */
         volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int    rx_found = 0;
+        int    consumed = 0;
         uint32_t rx_bytes = 0;
 
         for (int tries = 0; tries < 100000 && !rx_found; tries++) {
@@ -1117,9 +1125,16 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
             evq[sc->data_evq_read_ptr] = 0;
             sc->data_evq_read_ptr = (sc->data_evq_read_ptr + 1) &
                                (SFC7120_NUM_EVQ_ENTRY - 1);
-            /* NOTE (1d barebones): data EVQ's RPTR doorbell is at a different
-             * per-VI offset than EVQ 0's hardcoded 0x0400 — skip it for now to
-             * avoid corrupting the control EVQ (see TX path note above). */
+            consumed++;
+        }
+
+        /* Ack consumed events on the data EVQ's instance-1 RPTR doorbell
+         * (0x2400) — see the TX path note above. */
+        if (consumed > 0) {
+            bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
+                            BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+            SFC7120_WRITE_REG(sc, SFC7120_REG_DATA_EVQ_RPTR_DBL,
+                (uint32_t)sc->data_evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
         }
 
         if (!rx_found) {
@@ -1211,8 +1226,7 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
 #define SFC7120_LC_FLAG_LINK_UP      (1u << 0)
 #define SFC7120_LC_FLAG_FDX          (1u << 1)
 
-/* EVQ_RPTR doorbell: bits 0..14 are the read-pointer (mod 2^15). */
-#define SFC7120_EVQ_RPTR_MASK        0x7fffu
+/* SFC7120_EVQ_RPTR_MASK lives in sfc7120_mmio.h next to the register. */
 
 static uint32_t
 sfc7120_linkchange_speed_mbps(uint32_t code)

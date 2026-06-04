@@ -31,6 +31,21 @@ typedef enum {
     SFC7120_REGION_COUNT
 } sfc7120_vm_map_type_t;
 
+/*
+ * MMIO slice indices — must match the order of sfc7120_reg_slices[] in
+ * sfc7120_tables.c. Userspace receives the slice capabilities as an array
+ * in manifest order; the name field copied out is a kernel pointer and
+ * cannot be dereferenced, so index is the lookup key.
+ */
+typedef enum sfc7120_mmio_slice_idx {
+    SFC7120_SLICE_MC_DOORBELL = 0,     /* 0x0200 — MCDI kick (kernel use) */
+    SFC7120_SLICE_DATA_EVQ_RPTR_DBL,   /* 0x2400 — data EVQ (instance 1) ack */
+    SFC7120_SLICE_RX_DESC_DBL,         /* 0x0830 — RX producer push */
+    SFC7120_SLICE_TX_DESC_DBL,         /* 0x0a10, 12 B (incl. +8 WPTR push) */
+    SFC7120_SLICE_HW_REV_ID,           /* 0x0000 — RO liveness check */
+    SFC7120_SLICE_COUNT
+} sfc7120_mmio_slice_idx_t;
+
 /* Every CAPIO IOCTL struct must begin with user_cap + sealed_cap. */
 
 typedef struct sfc7120_mac_req {
