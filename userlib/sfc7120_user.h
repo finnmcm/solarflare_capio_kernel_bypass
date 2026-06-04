@@ -30,6 +30,16 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
     void   *tx_buffer;
     void   *rx_buffer;
 
+    /* Phase C: direct data-path resources */
+    void   *tx_desc_ring;          /* 4 KB mapped TX descriptor ring */
+    void   *rx_desc_ring;          /* 4 KB mapped RX descriptor ring */
+    void   *evq_ring;              /* 4 KB mapped data-EVQ (instance 1) ring */
+
+    user_slice_def_t *mmio_slices; /* bounded caps, indexed by sfc7120_mmio_slice_idx_t */
+    size_t            mmio_slices_len;
+
+    sfc7120_vi_info_req_t vi_info; /* paddrs, vi_base, instances, counts, heads */
+
     void   *cap_token;  /* malloc'd page — raw material for CAPIO_ATTACH seal */
 } sfc7120_if_t;
 

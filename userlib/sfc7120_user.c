@@ -8,17 +8,62 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/*
+ * map_region — map one CAPIO region, sliced or not.
+ *
+ * Always asks the kernel for the region's size and slice count first
+ * (MODMAPIOC_GET_SLICES), so callers never compute lengths themselves.
+ *
+ * Unsliced (out_slices == NULL): returns a capability to the whole region.
+ *
+ * Sliced (out_slices != NULL): allocates the slice array — a real bounded
+ * allocation, the kernel validates its length via cheri_getlen — and the
+ * kernel fills each entry's addr with a per-register bounded capability.
+ * Slices come back by position in sfc7120_reg_slices[] order
+ * (../sfc7120_tables.c); index with sfc7120_mmio_slice_idx_t. There is no
+ * whole-region capability for a sliced region — the returned value is just
+ * slices[0].addr, the slice array is what matters.
+ */
 static void *
-map_buffer(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type, size_t len)
+map_region(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type,
+           user_slice_def_t **out_slices, size_t *out_slice_len)
 {
-    user_map_req_t map_req;
-    map_req.user_cap   = sfc->cap_req.user_cap;
-    map_req.sealed_cap = sfc->cap_req.sealed_cap;
-    map_req.map_type   = (int)map_type;
+    get_slice_length_t length_req;
+    length_req.fd       = sfc->fd;
+    length_req.map_type = (int)map_type;
+
+    if (ioctl(sfc->modmap_fd, MODMAPIOC_GET_SLICES, &length_req) < 0) {
+        perror("sfc7120: MODMAPIOC_GET_SLICES failed");
+        return NULL;
+    }
+
+    size_t n_slices   = length_req.region_sizes.slice_def_length;
+    size_t region_len = length_req.region_sizes.region_length;
+
+    user_slice_def_t *slices = NULL;
+    if (out_slices != NULL) {
+        slices = calloc(n_slices ? n_slices : 1, sizeof(user_slice_def_t));
+        if (slices == NULL) {
+            perror("sfc7120: calloc slices");
+            return NULL;
+        }
+    } else if (n_slices != 0) {
+        fprintf(stderr, "sfc7120: region %d is sliced (%zu slices) but no "
+                "slice array was passed\n", (int)map_type, n_slices);
+        return NULL;
+    }
+
+    /* Zero-init: the kernel copyincap's the whole struct, so the slice
+     * fields must not be stack garbage even for unsliced regions. */
+    user_map_req_t map_req = { 0 };
+    map_req.user_cap          = sfc->cap_req.user_cap;
+    map_req.sealed_cap        = sfc->cap_req.sealed_cap;
+    map_req.map_type          = (int)map_type;
+    map_req.slice_definitions = slices;
 
     mmap_req_user_t req;
     req.addr  = NULL;
-    req.len   = len;
+    req.len   = region_len;
     req.prot  = PROT_READ | PROT_WRITE;
     req.flags = MAP_SHARED;
     req.fd    = sfc->fd;
@@ -27,7 +72,14 @@ map_buffer(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type, size_t len)
 
     if (ioctl(sfc->modmap_fd, MODMAPIOC_MAP, &req) < 0) {
         perror("sfc7120: MODMAPIOC_MAP failed");
+        free(slices);
         return NULL;
+    }
+
+    if (out_slices != NULL) {
+        *out_slices = slices;
+        if (out_slice_len != NULL)
+            *out_slice_len = n_slices;
     }
     return req.addr;
 }
@@ -35,10 +87,15 @@ map_buffer(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type, size_t len)
 int
 sfc7120_init(sfc7120_if_t *sfc)
 {
-    sfc->fd        = -1;
-    sfc->modmap_fd = -1;
-    sfc->tx_buffer = NULL;
-    sfc->rx_buffer = NULL;
+    sfc->fd           = -1;
+    sfc->modmap_fd    = -1;
+    sfc->tx_buffer    = NULL;
+    sfc->rx_buffer    = NULL;
+    sfc->tx_desc_ring = NULL;
+    sfc->rx_desc_ring = NULL;
+    sfc->evq_ring     = NULL;
+    sfc->mmio_slices  = NULL;
+    sfc->mmio_slices_len = 0;
 
     const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
     sfc->fd = open(dev, O_RDWR);
@@ -66,17 +123,53 @@ sfc7120_init(sfc7120_if_t *sfc)
         goto fail;
     }
 
-    sfc->tx_buffer = map_buffer(sfc, SFC7120_TX_BUFFER,
-                                SFC7120_NUM_TX_DESC * SFC7120_TX_BUFFER_SIZE);
+    sfc->tx_buffer = map_region(sfc, SFC7120_TX_BUFFER, NULL, NULL);
     if (sfc->tx_buffer == NULL) {
         perror("sfc7120_init: map TX buffer");
         goto fail;
     }
 
-    sfc->rx_buffer = map_buffer(sfc, SFC7120_RX_BUFFER,
-                                SFC7120_NUM_RX_DESC * SFC7120_RX_BUFFER_SIZE);
+    sfc->rx_buffer = map_region(sfc, SFC7120_RX_BUFFER, NULL, NULL);
     if (sfc->rx_buffer == NULL) {
         perror("sfc7120_init: map RX buffer");
+        goto fail;
+    }
+
+    /* Phase C: descriptor rings + data EVQ ring (4 KB each) */
+    sfc->tx_desc_ring = map_region(sfc, SFC7120_TX_DESC_RING, NULL, NULL);
+    if (sfc->tx_desc_ring == NULL) {
+        perror("sfc7120_init: map TX desc ring");
+        goto fail;
+    }
+
+    sfc->rx_desc_ring = map_region(sfc, SFC7120_RX_DESC_RING, NULL, NULL);
+    if (sfc->rx_desc_ring == NULL) {
+        perror("sfc7120_init: map RX desc ring");
+        goto fail;
+    }
+
+    sfc->evq_ring = map_region(sfc, SFC7120_EVQ_RING, NULL, NULL);
+    if (sfc->evq_ring == NULL) {
+        perror("sfc7120_init: map EVQ ring");
+        goto fail;
+    }
+
+    /* Phase C: per-register doorbell capabilities from the sliced BAR */
+    if (map_region(sfc, SFC7120_MMIO_REGION,
+                   &sfc->mmio_slices, &sfc->mmio_slices_len) == NULL) {
+        perror("sfc7120_init: map MMIO slices");
+        goto fail;
+    }
+    if (sfc->mmio_slices_len != SFC7120_SLICE_COUNT)
+        fprintf(stderr, "sfc7120_init: warning: kernel reports %zu MMIO "
+                "slices, expected %d — slice indices may be stale\n",
+                sfc->mmio_slices_len, SFC7120_SLICE_COUNT);
+
+    /* Phase C: VI geometry — DMA bus addresses, instances, head pointers */
+    sfc->vi_info.user_cap   = sfc->cap_req.user_cap;
+    sfc->vi_info.sealed_cap = sfc->cap_req.sealed_cap;
+    if (ioctl(sfc->fd, SFC7120_GET_VI_INFO, &sfc->vi_info) < 0) {
+        perror("sfc7120_init: SFC7120_GET_VI_INFO");
         goto fail;
     }
 
@@ -153,6 +246,11 @@ sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out)
 void
 sfc7120_destroy(sfc7120_if_t *sfc)
 {
+    if (sfc->mmio_slices != NULL) {
+        free(sfc->mmio_slices);
+        sfc->mmio_slices = NULL;
+        sfc->mmio_slices_len = 0;
+    }
     if (sfc->cap_token != NULL) {
         free(sfc->cap_token);
         sfc->cap_token = NULL;

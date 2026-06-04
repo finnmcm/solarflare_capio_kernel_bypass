@@ -37,6 +37,36 @@ build_frame(uint8_t *frame, const uint8_t dst[6], const uint8_t src[6], int seq)
     memset(&frame[15], 0xA5, FRAME_LEN - 15);
 }
 
+/*
+ * dump_vi_state — print the Phase C mappings so hardware verification is
+ * observable: VI geometry from GET_VI_INFO, the mapped ring addresses, and
+ * a liveness read of HW_REV_ID through its bounded slice capability.
+ */
+static void
+dump_vi_state(const sfc7120_if_t *sfc)
+{
+    const sfc7120_vi_info_req_t *vi = &sfc->vi_info;
+
+    printf("test: vi_info: tx_paddr=0x%016lx rx_paddr=0x%016lx\n",
+           (unsigned long)vi->tx_buffer_paddr,
+           (unsigned long)vi->rx_buffer_paddr);
+    printf("test: vi_info: vi_base=%u evq=%u rxq=%u txq=%u "
+           "ntx=%u nrx=%u nevq=%u tx_head=%u rx_head=%u evq_rptr=%u\n",
+           vi->vi_base, vi->evq_instance, vi->rxq_instance, vi->txq_instance,
+           vi->num_tx_desc, vi->num_rx_desc, vi->num_evq_entry,
+           vi->tx_head, vi->rx_head, vi->evq_read_ptr);
+    printf("test: rings: tx_desc=%p rx_desc=%p evq=%p (slices=%zu)\n",
+           sfc->tx_desc_ring, sfc->rx_desc_ring, sfc->evq_ring,
+           sfc->mmio_slices_len);
+
+    if (sfc->mmio_slices_len > SFC7120_SLICE_HW_REV_ID) {
+        uint32_t rev = *(volatile uint32_t * __capability)
+            sfc->mmio_slices[SFC7120_SLICE_HW_REV_ID].addr;
+        printf("test: HW_REV_ID via slice cap = 0x%08x (%s)\n",
+               rev, rev != 0 ? "ok" : "BAD — expected non-zero");
+    }
+}
+
 static int
 run_producer(void)
 {
@@ -50,6 +80,7 @@ run_producer(void)
     printf("test: producer up on %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
            DEV_PF0, sfc.mac_addr[0], sfc.mac_addr[1], sfc.mac_addr[2],
            sfc.mac_addr[3], sfc.mac_addr[4], sfc.mac_addr[5]);
+    dump_vi_state(&sfc);
 
     /* PF1 MAC = PF0 base MAC + 1 in the low octet. */
     memcpy(dst, sfc.mac_addr, 6);
@@ -83,6 +114,7 @@ run_consumer(void)
     printf("test: consumer up on %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
            DEV_PF1, sfc.mac_addr[0], sfc.mac_addr[1], sfc.mac_addr[2],
            sfc.mac_addr[3], sfc.mac_addr[4], sfc.mac_addr[5]);
+    dump_vi_state(&sfc);
 
     for (int i = 0; i < TEST_PACKETS; i++) {
         size_t len = 0;
