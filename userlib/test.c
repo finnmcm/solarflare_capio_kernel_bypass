@@ -58,6 +58,10 @@ dump_vi_state(const sfc7120_if_t *sfc)
     printf("test: rings: tx_desc=%p rx_desc=%p evq=%p (slices=%zu)\n",
            sfc->tx_desc_ring, sfc->rx_desc_ring, sfc->evq_ring,
            sfc->mmio_slices_len);
+    /* The MMIO base is a munmap token: full-region bounds, but LOAD/STORE
+     * stripped — %#p shows the perms so that's verifiable on hardware. */
+    printf("test: mmio base cap (munmap token) = %#p\n",
+           sfc->region_maps[SFC7120_MMIO_REGION].base);
 
     if (sfc->mmio_slices_len > SFC7120_SLICE_HW_REV_ID) {
         uint32_t rev = *(volatile uint32_t * __capability)

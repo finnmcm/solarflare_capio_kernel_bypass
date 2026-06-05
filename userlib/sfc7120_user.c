@@ -20,9 +20,13 @@
  * allocation, the kernel validates its length via cheri_getlen — and the
  * kernel fills each entry's addr with a per-register bounded capability.
  * Slices come back by position in sfc7120_reg_slices[] order
- * (../sfc7120_tables.c); index with sfc7120_mmio_slice_idx_t. There is no
- * whole-region capability for a sliced region — the returned value is just
- * slices[0].addr, the slice array is what matters.
+ * (../sfc7120_tables.c); index with sfc7120_mmio_slice_idx_t. The returned
+ * value is the full-region capability with LOAD/STORE stripped — a munmap
+ * token only (modmap keeps SW_VMEM + bounds so destroy can unmap the
+ * region); all register access goes through the slice caps.
+ *
+ * Every successful map is recorded in sfc->region_maps[map_type] so
+ * sfc7120_destroy can munmap it.
  */
 static void *
 map_region(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type,
@@ -39,6 +43,13 @@ map_region(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type,
 
     size_t n_slices   = length_req.region_sizes.slice_def_length;
     size_t region_len = length_req.region_sizes.region_length;
+
+    if (region_len == 0) {
+        fprintf(stderr, "sfc7120: region %d has length 0 — kernel region "
+                "state is stale (smem len wiped by a prior teardown?); "
+                "reload sfc7120pol.ko\n", (int)map_type);
+        return NULL;
+    }
 
     user_slice_def_t *slices = NULL;
     if (out_slices != NULL) {
@@ -81,6 +92,9 @@ map_region(sfc7120_if_t *sfc, sfc7120_vm_map_type_t map_type,
         if (out_slice_len != NULL)
             *out_slice_len = n_slices;
     }
+
+    sfc->region_maps[map_type].base = req.addr;
+    sfc->region_maps[map_type].len  = region_len;
     return req.addr;
 }
 
@@ -96,6 +110,7 @@ sfc7120_init(sfc7120_if_t *sfc)
     sfc->evq_ring     = NULL;
     sfc->mmio_slices  = NULL;
     sfc->mmio_slices_len = 0;
+    memset(sfc->region_maps, 0, sizeof(sfc->region_maps));
 
     const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
     sfc->fd = open(dev, O_RDWR);
@@ -246,11 +261,32 @@ sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out)
 void
 sfc7120_destroy(sfc7120_if_t *sfc)
 {
-    /* Tell the kernel to revoke our token and unmap every region BEFORE we
-     * tear down. The CAPIO `mapped` flag is only cleared in capio_pager_dtor,
-     * which fires from the vm_map_remove inside revoke_cap_token. Without this
-     * the regions stay flagged mapped after we exit, and the next run on this
-     * PF fails the re-map with EINVAL (capio.c: "if(smem.mapped) return EINVAL").
+    /* munmap every mapped region FIRST. Each munmap drops the cdev_pager
+     * object's last reference, firing capio_pager_dtor, which is the only
+     * thing that clears the kernel's per-region `mapped` flag — without it
+     * the next run on this PF fails the re-map with EINVAL (capio.c:
+     * "if(smem.mapped) return EINVAL"). The kernel-side vm_map_remove in
+     * revoke_cap_token does NOT fire the dtor, so it cannot replace this
+     * (matches the e1000/mlx5 reference drivers, which munmap everything).
+     * For the sliced MMIO region, base is the perm-stripped full-region cap. */
+    for (int i = 0; i < SFC7120_REGION_COUNT; i++) {
+        if (sfc->region_maps[i].base != NULL) {
+            if (munmap(sfc->region_maps[i].base, sfc->region_maps[i].len) != 0) {
+                fprintf(stderr, "sfc7120_destroy: munmap region %d: ", i);
+                perror(NULL);
+            }
+            sfc->region_maps[i].base = NULL;
+            sfc->region_maps[i].len  = 0;
+        }
+    }
+    sfc->tx_buffer    = NULL;
+    sfc->rx_buffer    = NULL;
+    sfc->tx_desc_ring = NULL;
+    sfc->rx_desc_ring = NULL;
+    sfc->evq_ring     = NULL;
+
+    /* THEN revoke the token so the next run's CAPIO_ATTACH succeeds. Its
+     * vm_map_remove fallback finds the ranges already unmapped and no-ops.
      * Must run while sfc->fd is still open and before freeing cap_token. */
     if (sfc->fd >= 0)
         (void)ioctl(sfc->fd, CAPIO_GOODBYE, &sfc->cap_req);

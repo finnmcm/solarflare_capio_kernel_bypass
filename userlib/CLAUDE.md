@@ -109,30 +109,30 @@ register, each bounded to exactly that register.
 
 ---
 
-## Current State (as of 2026-06-03)
+## Current State (as of 2026-06-05)
 
-**Phase 1 (ioctl path) works; Phase A (kernel ring exposure) is done.** The
-kernel now exposes the TX/RX descriptor rings and the data EVQ ring as CAPIO
-regions and answers `SFC7120_GET_VI_INFO` (see the Phase A entry below) —
-hardware-verified. Userspace does not yet *use* these (that is Phase C+);
-`test.c` still drives traffic through the ioctl path.
+**Phase 1 (ioctl path) works; all Phase C prerequisites are in place,
+hardware-verified.** Userspace now maps **all six regions** (TX/RX packet
+buffers, TX/RX desc rings, data-EVQ ring, sliced MMIO) and reads `GET_VI_INFO`
+at init; MMIO *reads* through slice caps work (`HW_REV_ID = 0xeb14face` —
+required the `VM_MEMATTR_DEVICE` capio fix, see Gotcha 9); and teardown is
+clean (repeated runs on one PF, no module reload — required the
+munmap-in-destroy rework, see Gotcha 10). The data path itself is still the
+ioctls — moving it to userspace is Phases C–F below.
 
 **Phase 1 (ioctl path) works.** `test.c` (`sfctest`) sends frames PF0→PF1 over a
 DAC cable and receives them, today. That path is:
 
-- `sfc7120_init` (`sfc7120_user.c:35`): `open("/dev/sfc7120pol{0,1}")` →
-  `CAPIO_ATTACH` (seals a malloc'd token page) → mmap the TX and RX **packet
-  buffers** via `/dev/modmap` → `SFC7120_GET_MAC`.
-- `sfc7120_tx` / `sfc7120_rx` (`sfc7120_user.c:107`, `:132`): package the buffer
-  into a `sfc7120_tx_req_t` / `sfc7120_rx_req_t` and call the **`SFC7120_TX` /
-  `SFC7120_RX` ioctls**. The *kernel* copies the packet, writes the descriptor,
-  rings the doorbell, and polls the data EVQ.
-
-So today the process maps only the two packet buffers and the (sliced) MMIO
-region, and the kernel still does every per-packet operation. The descriptor
-rings and the data EVQ ring are now **mappable** (Phase A added the regions +
-`GET_VI_INFO`), but the userspace library does not yet map or use them —
-closing that gap is the whole roadmap below.
+- `sfc7120_init`: `open("/dev/sfc7120pol{0,1}")` → `CAPIO_ATTACH` (seals a
+  malloc'd token page) → `map_region` × 6 via `/dev/modmap` (recorded in
+  `region_maps[]` for destroy-time munmap) → `SFC7120_GET_MAC` +
+  `SFC7120_GET_VI_INFO`.
+- `sfc7120_tx` / `sfc7120_rx`: package the buffer into a `sfc7120_tx_req_t` /
+  `sfc7120_rx_req_t` and call the **`SFC7120_TX` / `SFC7120_RX` ioctls**. The
+  *kernel* copies the packet, writes the descriptor, rings the doorbell, and
+  polls the data EVQ.
+- `sfc7120_destroy`: munmap every region in `region_maps[]` (fires the capio
+  pager dtor, clearing the kernel `mapped` flags), then `CAPIO_GOODBYE`.
 
 On the kernel side, the relevant facts are already in place: two EVQs exist
 (**EVQ 0** control/interrupting, owned by the kernel ISR; **EVQ 1** data/
@@ -253,33 +253,32 @@ on every post.
 
 ## Kernel / Userspace Interface
 
-### Today (Phase 1)
+### Today
 
 | Region (`sfc7120_vm_map_type_t`) | Mapped by userspace? | Backing |
 |---|---|---|
-| `SFC7120_TX_BUFFER` | yes (`map_buffer`) | 1 MB DMA packet buffer |
-| `SFC7120_RX_BUFFER` | yes (`map_buffer`) | 1 MB DMA packet buffer |
+| `SFC7120_TX_BUFFER` | yes | 1 MB DMA packet buffer |
+| `SFC7120_RX_BUFFER` | yes | 1 MB DMA packet buffer |
+| `SFC7120_TX_DESC_RING` | yes | 4 KB TX descriptor ring |
+| `SFC7120_RX_DESC_RING` | yes | 4 KB RX descriptor ring |
+| `SFC7120_EVQ_RING` | yes | 4 KB data-EVQ (instance 1) ring |
 | `SFC7120_MMIO_REGION` | yes (sliced) | BAR2 (8 MB), bounded per-register |
 
+All mapped by the single `map_region()` helper, which queries
+`MODMAP_GET_SLICES` first so the kernel's `get_buffer_size` is the only
+source of region lengths. For the sliced MMIO region, modmap returns the
+full-region cap with LOAD/STORE **stripped** — a munmap token only; all
+register access goes through the per-slice caps (indexed by
+`sfc7120_mmio_slice_idx_t` — slice order is ABI, the `name` field is a
+kernel pointer and unusable).
+
 IOCTLs: `CAPIO_ATTACH` / `CAPIO_GOODBYE` (capio.h), `SFC7120_TX` / `SFC7120_RX` /
-`SFC7120_GET_MAC` (`../sfc7120_uapi.h`).
+`SFC7120_GET_MAC` / `SFC7120_GET_VI_INFO` (`../sfc7120_uapi.h`).
 
 Slice manifest (`../sfc7120_tables.c`, corrected in Phase B): `MC_DOORBELL`
 (`0x200`), `DATA_EVQ_RPTR_DBL` (`0x2400` — instance 1's window),
 `RX_DESC_DBL` (`0x830`), `TX_DESC_DBL` (`0xa10`, 12 B), `HW_REV_ID` (RO).
 The control EVQ 0 RPTR (`0x400`) is deliberately not exposed — kernel-owned.
-
-### What must be added (Phases A–B)
-
-- Three new regions: `SFC7120_TX_DESC_RING`, `SFC7120_RX_DESC_RING`,
-  `SFC7120_EVQ_RING` (the data EVQ, instance 1) — `is_physical=false`, backed by
-  the already-allocated `sc->tx_desc_ring` / `rx_desc_ring` / `data_evq_ring`.
-- A `SFC7120_GET_VI_INFO` ioctl that follows ef_vi's resource-manager model —
-  the kernel hands userspace everything it needs to drive the VI itself:
-  `tx_buffer_paddr`, `rx_buffer_paddr` (the ef_memreg-style NIC-visible buffer
-  addresses), `vi_base`, the EVQ/RXQ/TXQ instance numbers, ring/desc counts, and
-  the initial head pointers.
-- Corrected doorbell slices for the *actual* data-path VI instances.
 
 ---
 

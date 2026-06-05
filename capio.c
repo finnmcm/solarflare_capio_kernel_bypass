@@ -249,10 +249,12 @@ static int revoke_cap_token(capio_softc_t* sc, struct thread *td){
 
             error = delete_mapping_from_user(sc, smem.offset, smem.len, td);
             if(!error){
-                // only clear on success because we know the mapping is gone
+                /* Only clear offset — `len` doubles as the static region
+                 * length reported by capio_slice_length_callback. Zeroing it
+                 * here made every re-attach after the first GOODBYE mmap with
+                 * len=0 and fail EINVAL in kern_mmap until module reload. */
                 CAP_LOCK(sc);
                 sc->shared_mem_regs[i].offset = 0;
-                sc->shared_mem_regs[i].len = 0;
                 CAP_UNLOCK(sc);
             }
         }
@@ -395,6 +397,11 @@ static int capio_mmap_single_extra(struct cdev *cdev, vm_ooffset_t *offset, vm_s
             }
 
             if(smem.mapped){
+                /* Must drop the lock before returning — leaking it here
+                 * wedges every later CAP_LOCK user until module reload. */
+                CAP_UNLOCK(cap_sc);
+                device_printf(cap_sc->dev, "Region type %d already mapped, refusing re-map\n",
+                         smem.type);
                 return EINVAL;
             }
 
@@ -465,6 +472,8 @@ static void
 capio_pager_dtor(void *handle){
     vm_object_handle_t *obj_handle = (vm_object_handle_t *)handle;
     capio_softc_t *sc = &((capio_softc_header_t*)obj_handle->sc)->capio_sc;
+
+    device_printf(sc->dev, "pager dtor: region type %d unmapped\n", obj_handle->type);
 
 	CAP_LOCK(sc);
     bool no_mapped = true;
