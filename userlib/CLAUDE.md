@@ -111,14 +111,16 @@ register, each bounded to exactly that register.
 
 ## Current State (as of 2026-06-05)
 
-**Phase 1 (ioctl path) works; all Phase C prerequisites are in place,
-hardware-verified.** Userspace now maps **all six regions** (TX/RX packet
+**Phase 1 (ioctl path) works; Phase C (direct EVQ polling) is done,
+hardware-verified.** Userspace maps **all six regions** (TX/RX packet
 buffers, TX/RX desc rings, data-EVQ ring, sliced MMIO) and reads `GET_VI_INFO`
 at init; MMIO *reads* through slice caps work (`HW_REV_ID = 0xeb14face` —
-required the `VM_MEMATTR_DEVICE` capio fix, see Gotcha 9); and teardown is
+required the `VM_MEMATTR_DEVICE` capio fix, see Gotcha 9); teardown is
 clean (repeated runs on one PF, no module reload — required the
-munmap-in-destroy rework, see Gotcha 10). The data path itself is still the
-ioctls — moving it to userspace is Phases C–F below.
+munmap-in-destroy rework, see Gotcha 10); and `sfc7120_poll` drains the data
+EVQ with zero syscalls (`sfctest poll` sees 4/4 RX events vs the kernel TX
+path). Descriptor posting is still the ioctls — Phases D–F move it to
+userspace.
 
 **Phase 1 (ioctl path) works.** `test.c` (`sfctest`) sends frames PF0→PF1 over a
 DAC cable and receives them, today. That path is:
@@ -312,15 +314,19 @@ handlers now ack the data EVQ at `0x2400` (previously skipped).
 TX/RX ringing `0x2400`. Userspace slice verify (HW_REV_ID read,
 out-of-slice trap) folded into Phase C.
 
-### 🔜 Phase C — Userspace: direct EVQ polling (read path first)
-Implement `sfc7120_poll` over the mapped data-EVQ ring: all-`0xFF` empty
-detection, decode RX_EV/TX_EV, advance the read pointer, write the EVQ-1 RPTR
-doorbell through the MMIO slice cap, `dsb sy`. Keep the kernel posting
-descriptors for now.
-**Verify:** poll reports the same events, in order, that the ioctl oracle
-consumes. Also (carried from Phase B): read `HW_REV_ID` through its slice
-cap, and confirm an out-of-slice doorbell write **traps** (CHERI bounds)
-rather than corrupting the device.
+### ✅ Phase C — Userspace: direct EVQ polling (read path first) (done 2026-06-05)
+`sfc7120_poll` over the mapped data-EVQ ring: empty = all-ones **or zero**
+(consumers zero slots; the "nibble 0xF" shorthand was incomplete), decode
+RX_EV/TX_EV, `dsb sy` + EVQ-1 RPTR ack through the `0x2400` slice cap. Kernel
+still posts descriptors. `SFC7120_SET_EVQ_RPTR` ioctl syncs the read ptr back
+at destroy.
+**Verified on hardware (2026-06-05):** `sfctest poll` (PF1) vs `sfctest tx`
+(PF0) sees 4/4 RX_EVs in order, zero syscalls in the poll loop. First event
+is the firmware EVQ start-up event (`DRIVER_EV`/`START_UP`, sub_data = abs VI
+id) — expected once per `INIT_EVQ`, skipped as OTHER. (A `read_ptr` trace
+oddity of 1→2→4→4→5 is a printf artifact: test.c prints the live shared ptr
+after a batched poll — not a logic bug.) HW_REV_ID slice read verified
+2026-06-04; the out-of-slice trap test moves to Phase G.
 
 ### 🔜 Phase D — Userspace: direct RX (post + doorbell)
 Pre-post RX descriptors into the mapped `rx_desc_ring`

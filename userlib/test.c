@@ -135,18 +135,74 @@ run_consumer(void)
     return 0;
 }
 
+/*
+ * run_poller — Phase C consumer: drains the data EVQ directly via
+ * sfc7120_poll (zero syscalls in the poll loop) instead of the SFC7120_RX
+ * ioctl. The kernel still owns descriptor posting; we only observe + ack
+ * events. Run `sfctest tx` on PF0 as the producer — each 64-byte frame
+ * should appear here as one RX_EV with rx_bytes = 64 + 14 (EF10 prefix).
+ */
+static int
+run_poller(void)
+{
+    sfc7120_if_t sfc = { .dev_path = DEV_PF1 };
+    sfc7120_ev_t evs[8];
+    int          rx_seen = 0;
+    long         tries;
+
+    if (sfc7120_init(&sfc) != 0) {
+        fprintf(stderr, "test: poller init failed\n");
+        return 1;
+    }
+    printf("test: poller up on %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+           DEV_PF1, sfc.mac_addr[0], sfc.mac_addr[1], sfc.mac_addr[2],
+           sfc.mac_addr[3], sfc.mac_addr[4], sfc.mac_addr[5]);
+    dump_vi_state(&sfc);
+    printf("test: polling data EVQ from read_ptr=%u (start `sfctest tx` "
+           "on PF0)\n", sfc.evq_read_ptr);
+
+    /* Generous budget — the oracle spins 100000 tries per packet; we wait
+     * for a human to launch the producer in another window. */
+    for (tries = 0; tries < 2000000000L && rx_seen < TEST_PACKETS; tries++) {
+        int n = sfc7120_poll(&sfc, evs, 8);
+        if (n < 0) {
+            fprintf(stderr, "test: sfc7120_poll failed\n");
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            const char *name =
+                evs[i].type == SFC7120_EV_RX ? "RX_EV" :
+                evs[i].type == SFC7120_EV_TX ? "TX_EV" : "OTHER";
+            printf("test: ev %s raw=0x%016lx rx_bytes=%u tx_idx=%u "
+                   "read_ptr now %u\n",
+                   name, (unsigned long)evs[i].raw, evs[i].rx_bytes,
+                   evs[i].tx_desc_idx, sfc.evq_read_ptr);
+            if (evs[i].type == SFC7120_EV_RX)
+                rx_seen++;
+        }
+    }
+
+    printf("test: poller saw %d/%d RX events (final read_ptr=%u)\n",
+           rx_seen, TEST_PACKETS, sfc.evq_read_ptr);
+    sfc7120_destroy(&sfc);
+    printf("test: poller done\n");
+    return rx_seen == TEST_PACKETS ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s tx|rx\n", argv[0]);
+        fprintf(stderr, "usage: %s tx|rx|poll\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "tx") == 0)
         return run_producer();
     if (strcmp(argv[1], "rx") == 0)
         return run_consumer();
+    if (strcmp(argv[1], "poll") == 0)
+        return run_poller();
 
-    fprintf(stderr, "usage: %s tx|rx\n", argv[0]);
+    fprintf(stderr, "usage: %s tx|rx|poll\n", argv[0]);
     return 2;
 }

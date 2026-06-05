@@ -17,6 +17,28 @@
 #define DEVSFC7120 "/dev/sfc7120pol1" // our actual module in tree
 #define DEVMODMAP  "/dev/modmap"
 
+/* EVQ_RPTR doorbell: bits 0..14 are the read pointer (mod 2^15).
+ * Mirrors SFC7120_EVQ_RPTR_MASK in ../sfc7120_mmio.h (kernel-only header). */
+#define SFC7120_EVQ_RPTR_MASK 0x7fffu
+
+/*
+ * sfc7120_poll event types — decoded from the EV_CODE nibble (bits 63:60)
+ * exactly as the kernel ioctl handlers do: RX_EV=0, TX_EV=2; everything
+ * else (DRIVER_EV=5, MCDI_EV=12, ...) is consumed but reported as OTHER.
+ */
+typedef enum {
+    SFC7120_EV_RX,
+    SFC7120_EV_TX,
+    SFC7120_EV_OTHER,
+} sfc7120_ev_type_t;
+
+typedef struct sfc7120_ev {
+    sfc7120_ev_type_t type;
+    uint16_t tx_desc_idx;  /* TX_EV: completed descriptor index (ev & 0xffff) */
+    uint16_t rx_bytes;     /* RX_EV: byte count incl. 14-byte prefix (ev & 0x3fff) */
+    uint64_t raw;          /* raw 8-byte event word */
+} sfc7120_ev_t;
+
 typedef struct sfc7120_if { // state struct, everything we need from kernel stub
     const char *dev_path;   /* device node to open; NULL → DEVSFC7120 default */
 
@@ -39,6 +61,8 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
     size_t            mmio_slices_len;
 
     sfc7120_vi_info_req_t vi_info; /* paddrs, vi_base, instances, counts, heads */
+    bool     vi_info_valid;        /* GET_VI_INFO succeeded — gates rptr sync */
+    uint32_t evq_read_ptr;         /* our data-EVQ read ptr (seeded from vi_info) */
 
     /* Per-region mapping record for munmap at destroy; indexed by
      * sfc7120_vm_map_type_t. For the sliced MMIO region, base is the
@@ -55,5 +79,6 @@ int  sfc7120_init(sfc7120_if_t *sfc);
 void sfc7120_destroy(sfc7120_if_t *sfc);
 int  sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len);
 int  sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out);
+int  sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs);
 
 #endif /* SFC7120_USER_H */
