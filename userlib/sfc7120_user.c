@@ -246,6 +246,15 @@ sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out)
 void
 sfc7120_destroy(sfc7120_if_t *sfc)
 {
+    /* Tell the kernel to revoke our token and unmap every region BEFORE we
+     * tear down. The CAPIO `mapped` flag is only cleared in capio_pager_dtor,
+     * which fires from the vm_map_remove inside revoke_cap_token. Without this
+     * the regions stay flagged mapped after we exit, and the next run on this
+     * PF fails the re-map with EINVAL (capio.c: "if(smem.mapped) return EINVAL").
+     * Must run while sfc->fd is still open and before freeing cap_token. */
+    if (sfc->fd >= 0)
+        (void)ioctl(sfc->fd, CAPIO_GOODBYE, &sfc->cap_req);
+
     if (sfc->mmio_slices != NULL) {
         free(sfc->mmio_slices);
         sfc->mmio_slices = NULL;

@@ -380,7 +380,18 @@ static int capio_mmap_single_extra(struct cdev *cdev, vm_ooffset_t *offset, vm_s
                      smem.type, smem.is_sliced, smem.is_physical);
 
             if(smem.is_physical){
+                /* Hardware register/BAR memory. On ARM64/Morello the name
+                 * VM_MEMATTR_UNCACHEABLE maps to *Normal* non-cacheable, which
+                 * is NOT device memory — the SFC9120 BIU appears to RAZ such
+                 * reads (HW_REV_ID via slice returned 0). VM_MEMATTR_DEVICE
+                 * (Device-nGnRE) is the correct, strongly-ordered attribute and
+                 * matches what the kernel's bus_space mapping uses. x86 has no
+                 * VM_MEMATTR_DEVICE; there UNCACHEABLE is already device-ordered. */
+#if defined(VM_MEMATTR_DEVICE)
+                mem_attributes = VM_MEMATTR_DEVICE;
+#else
                 mem_attributes = VM_MEMATTR_UNCACHEABLE;
+#endif
             }
 
             if(smem.mapped){
@@ -497,9 +508,17 @@ capio_pager_fault(vm_object_t obj, vm_ooffset_t offset, int prot, vm_page_t *mre
         if(smem->type == handle->type){
             if(smem->is_physical){
                 paddr = smem->paddr + offset;
+                /* See the matching note in capio_mmap_single_extra: on ARM64
+                 * this must be Device-nGnRE, not Normal-NC. This is the page
+                 * the CPU's load actually walks, so this line is the operative
+                 * one for the HW_REV_ID-via-slice read. */
+#if defined(VM_MEMATTR_DEVICE)
+                mem_attribute = VM_MEMATTR_DEVICE;
+#else
                 mem_attribute = VM_MEMATTR_UNCACHEABLE;
-                device_printf(sc->dev, "Mapping physical addr: 0x%lx (base: 0x%lx + offset: 0x%lx)\n", 
-                             paddr, smem->paddr, offset);
+#endif
+                device_printf(sc->dev, "Mapping physical addr: 0x%lx (base: 0x%lx + offset: 0x%lx) memattr=%d\n",
+                             paddr, smem->paddr, offset, mem_attribute);
             }
             else{
                 paddr = pmap_kextract(cheri_getaddress(smem->addr) + offset);
