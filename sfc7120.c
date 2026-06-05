@@ -955,6 +955,26 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         SFC7120_UNLOCK(sc);
         return 0;
     }
+    case SFC7120_SET_EVQ_RPTR: {
+        /*
+         * Phase C teardown sync: the userspace poll path consumes data-EVQ
+         * events directly (zeroes slots, advances its own read pointer,
+         * rings the RPTR doorbell), so the kernel's bookkeeping copy goes
+         * stale. Userspace reports its final read pointer here at destroy
+         * so the next run's GET_VI_INFO (and any later ioctl-path TX/RX)
+         * starts from the right slot. No hardware access — the doorbell
+         * was already rung by the poller.
+         */
+        sfc7120_evq_sync_req_t *req = (sfc7120_evq_sync_req_t *)data;
+
+        if (req->evq_read_ptr >= SFC7120_NUM_EVQ_ENTRY)
+            return EINVAL;
+
+        SFC7120_LOCK(sc);
+        sc->data_evq_read_ptr = req->evq_read_ptr;
+        SFC7120_UNLOCK(sc);
+        return 0;
+    }
     case SFC7120_TX: {
         /*
          * Phase 1 TX ioctl handler.

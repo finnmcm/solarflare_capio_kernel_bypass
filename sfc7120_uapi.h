@@ -113,10 +113,24 @@ typedef struct sfc7120_vi_info_req {
     uint32_t evq_read_ptr;      /* current data-EVQ read pointer */
 } sfc7120_vi_info_req_t;
 
+/*
+ * sfc7120_evq_sync_req_t — userspace reports its final data-EVQ read pointer
+ * back to the kernel at teardown (phase C+). The direct poll path consumes
+ * events the kernel never sees; without this sync the next run's GET_VI_INFO
+ * hands out a stale evq_read_ptr. Extends to tx_head/rx_head in later phases.
+ */
+typedef struct sfc7120_evq_sync_req {
+    void * __capability user_cap;
+    void * __capability sealed_cap;
+
+    uint32_t evq_read_ptr;      /* userspace's final data-EVQ read pointer */
+} sfc7120_evq_sync_req_t;
+
 /* IOCTLs — 'S' group matches the kernel definition. */
-#define SFC7120_RX          _IOWR('S', 1, sfc7120_rx_req_t)
-#define SFC7120_TX          _IOWR('S', 2, sfc7120_tx_req_t)
-#define SFC7120_GET_MAC     _IOWR('S', 3, sfc7120_mac_req_t)
-#define SFC7120_GET_VI_INFO _IOWR('S', 4, sfc7120_vi_info_req_t)
+#define SFC7120_RX           _IOWR('S', 1, sfc7120_rx_req_t)
+#define SFC7120_TX           _IOWR('S', 2, sfc7120_tx_req_t)
+#define SFC7120_GET_MAC      _IOWR('S', 3, sfc7120_mac_req_t)
+#define SFC7120_GET_VI_INFO  _IOWR('S', 4, sfc7120_vi_info_req_t)
+#define SFC7120_SET_EVQ_RPTR _IOWR('S', 5, sfc7120_evq_sync_req_t)
 
 #endif /* SFC7120_UAPI_H */

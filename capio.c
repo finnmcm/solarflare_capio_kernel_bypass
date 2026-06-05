@@ -418,9 +418,15 @@ static int capio_mmap_single_extra(struct cdev *cdev, vm_ooffset_t *offset, vm_s
     handle->sc = sc;
     handle->type = map_req->map_type;
 
-    // create vm object for user
+    /* create vm object for user. cdev_pager_allocate takes the size in
+     * BYTES (it does round_page + OFF_TO_IDX itself — device_pager.c).
+     * Passing OFF_TO_IDX(buffer_size) here shrank every region's object
+     * to ONE page: any access at offset >= 4 KB hit vm_fault's
+     * pindex >= object->size check → KERN_OUT_OF_BOUNDS → SIGBUS before
+     * the capio pager was ever called (no "Fault:" dmesg line). First
+     * tripped by the 0x2400 data-EVQ doorbell write in sfc7120_poll. */
 	obj = cdev_pager_allocate(handle, OBJT_DEVICE, &capio_cdev_pager_ops,
-	    OFF_TO_IDX(buffer_size), nprot, *offset, curthread->td_ucred);
+	    buffer_size, nprot, *offset, curthread->td_ucred);
 	if (obj == NULL)
 		return (ENXIO);
 
