@@ -113,6 +113,7 @@ sfc7120_init(sfc7120_if_t *sfc)
     sfc->vi_info_valid   = false;
     sfc->evq_read_ptr    = 0;
     sfc->used_poll       = false;
+    sfc->rx_head         = 0;
     memset(sfc->region_maps, 0, sizeof(sfc->region_maps));
 
     const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
@@ -194,6 +195,10 @@ sfc7120_init(sfc7120_if_t *sfc)
     /* Seed our data-EVQ read pointer from the kernel's bookkeeping; it is
      * synced back via SFC7120_SET_EVQ_RPTR at destroy. */
     sfc->evq_read_ptr = sfc->vi_info.evq_read_ptr;
+    /* Seed our RX consume/re-post slot from the kernel's post index. The
+     * kernel already seeded the RX ring at attach (sfc7120_post_rx_buffers),
+     * so direct RX just consumes + re-posts from here. */
+    sfc->rx_head = sfc->vi_info.rx_head;
 
     sfc7120_mac_req_t mac_req;
     mac_req.user_cap   = sfc->cap_req.user_cap;
@@ -342,6 +347,118 @@ sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs)
     }
 
     return n;
+}
+
+/*
+ * sfc7120_rx_direct — receive one packet straight from the mapped rings, with
+ * the kernel out of the data path (Phase D). This is the userspace mirror of
+ * the kernel SFC7120_RX handler (../sfc7120.c): identical event decode,
+ * 14-byte RX-prefix handling, and descriptor re-post — only the rings and
+ * doorbells are touched directly through CHERI capabilities, not via ioctl.
+ *
+ * Blocking: spins the data EVQ (instance 1) until an RX_EV arrives or the
+ * wait budget runs out. On success copies the frame (prefix stripped) into
+ * buf, sets *len_out to the frame length, returns 0; returns -1 on timeout
+ * or bad arguments.
+ *
+ * Single-owner contract: nothing else may consume this PF's data EVQ while
+ * direct RX runs — no kernel SFC7120_RX/TX ioctls on this fd. See the
+ * two-owner discussion in ../CLAUDE.md.
+ */
+int
+sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
+{
+    /* --- Step 0: guards + claim EVQ ownership for this session --- */
+    if (sfc == NULL || buf == NULL)
+        return -1;
+    if (sfc->evq_ring == NULL || sfc->rx_desc_ring == NULL ||
+        sfc->rx_buffer == NULL || sfc->mmio_slices == NULL ||
+        sfc->mmio_slices_len <= SFC7120_SLICE_DATA_EVQ_RPTR_DBL)
+        return -1;
+
+    /* We drive the data EVQ from userspace this session, so destroy must
+     * sync our read pointer back to the kernel (gated on used_poll). */
+    sfc->used_poll = true;
+
+    volatile uint64_t *evq     = (volatile uint64_t *)sfc->evq_ring;
+    volatile uint64_t *rx_ring = (volatile uint64_t *)sfc->rx_desc_ring;
+    uint8_t           *rxbuf   = (uint8_t *)sfc->rx_buffer;
+
+    /* --- Step 1: poll the data EVQ for an RX_EV (EV_CODE nibble == 0) ---
+     * Consume every event we pass (zero the slot, advance the read pointer),
+     * exactly as the kernel handler does. The budget is generous so a human
+     * can start the producer in another window. */
+    int      rx_found = 0;
+    int      consumed = 0;
+    uint32_t rx_bytes = 0;
+    const long RX_WAIT_BUDGET = 2000000000L;
+
+    for (long tries = 0; tries < RX_WAIT_BUDGET && !rx_found; tries++) {
+        uint64_t ev = evq[sfc->evq_read_ptr];
+
+        /* All-ones (never written) or zero (already consumed) = empty. */
+        if (ev == 0xffffffffffffffffULL || ev == 0)
+            continue;
+
+        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+        if (code == 0) {            /* RX_EV */
+            rx_bytes = (uint32_t)(ev & 0x3fff);
+            rx_found = 1;
+        }
+
+        /* Consume regardless of type (startup/TX events drained too). */
+        evq[sfc->evq_read_ptr] = 0;
+        sfc->evq_read_ptr =
+            (sfc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
+        consumed++;
+    }
+
+    /* --- Step 2: ack consumed events on the EVQ-1 RPTR doorbell (0x2400) --- */
+    if (consumed > 0) {
+        __asm__ volatile("dsb sy" ::: "memory");
+        *(volatile uint32_t * __capability)
+            sfc->mmio_slices[SFC7120_SLICE_DATA_EVQ_RPTR_DBL].addr =
+            sfc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK;
+    }
+
+    if (!rx_found)
+        return -1;                  /* timed out waiting for a packet */
+
+    /* --- Step 3: read the packet from the RX buffer slot ---
+     * Strip the 14-byte EF10 prefix; frame length is the LE uint16 at prefix
+     * offset +8. If that reads 0 (cut-through), derive from the event byte
+     * count. Mirrors the kernel exactly. */
+    uint8_t *slot = rxbuf + (size_t)sfc->rx_head * SFC7120_RX_BUFFER_SIZE;
+    uint16_t plen = (uint16_t)slot[8] | ((uint16_t)slot[9] << 8);
+    if (plen == 0)
+        plen = (rx_bytes > SFC7120_EF10_RX_PREFIX_LEN)
+               ? (uint16_t)(rx_bytes - SFC7120_EF10_RX_PREFIX_LEN) : 0;
+
+    memcpy(buf, slot + SFC7120_EF10_RX_PREFIX_LEN, plen);
+    if (len_out != NULL)
+        *len_out = plen;
+
+    /* --- Step 4: re-post this slot's descriptor so the NIC can reuse it ---
+     * 8-byte RX descriptor: BYTE_CNT (buffer capacity) in bits[61:48], bus
+     * address split across bits[47:32] (high 16) and bits[31:0] (low 32). */
+    uint64_t slot_pa = sfc->vi_info.rx_buffer_paddr +
+                       (uint64_t)sfc->rx_head * SFC7120_RX_BUFFER_SIZE;
+    rx_ring[sfc->rx_head] =
+        ((uint64_t)(SFC7120_RX_BUFFER_SIZE & 0x3fff) << 48) |
+        ((uint64_t)((slot_pa >> 32) & 0xffff)         << 32) |
+        ((uint64_t)(slot_pa & 0xffffffff));
+
+    /* --- Step 5: ring the RX producer doorbell, then advance rx_head ---
+     * Mirror the kernel verbatim: write the current rx_head as the producer
+     * pointer. (8-descriptor-aligned batched re-post is a Phase G tuning
+     * item; match the proven oracle first.) dsb sy orders the descriptor
+     * store before the doorbell kick. */
+    __asm__ volatile("dsb sy" ::: "memory");
+    *(volatile uint32_t * __capability)
+        sfc->mmio_slices[SFC7120_SLICE_RX_DESC_DBL].addr = sfc->rx_head;
+    sfc->rx_head = (sfc->rx_head + 1) & (SFC7120_NUM_RX_DESC - 1);
+
+    return 0;
 }
 
 void

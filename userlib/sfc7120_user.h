@@ -21,6 +21,11 @@
  * Mirrors SFC7120_EVQ_RPTR_MASK in ../sfc7120_mmio.h (kernel-only header). */
 #define SFC7120_EVQ_RPTR_MASK 0x7fffu
 
+/* EF10 low-latency firmware prepends a 14-byte metadata prefix to each RX
+ * packet in the buffer; frame length is the LE uint16 at prefix offset +8.
+ * Mirrors SFC7120_EF10_RX_PREFIX_LEN in ../sfc7120.c (kernel-only). */
+#define SFC7120_EF10_RX_PREFIX_LEN 14
+
 /*
  * sfc7120_poll event types — decoded from the EV_CODE nibble (bits 63:60)
  * exactly as the kernel ioctl handlers do: RX_EV=0, TX_EV=2; everything
@@ -67,6 +72,8 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
                                     * is evq_read_ptr ours to sync back. In the
                                     * ioctl-only path the kernel owns the EVQ
                                     * pointer and must NOT be clobbered. */
+    uint32_t rx_head;              /* our RX slot to consume + re-post next;
+                                    * seeded from vi_info.rx_head (direct RX) */
 
     /* Per-region mapping record for munmap at destroy; indexed by
      * sfc7120_vm_map_type_t. For the sliced MMIO region, base is the
@@ -83,6 +90,7 @@ int  sfc7120_init(sfc7120_if_t *sfc);
 void sfc7120_destroy(sfc7120_if_t *sfc);
 int  sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len);
 int  sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out);
+int  sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out);
 int  sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs);
 
 #endif /* SFC7120_USER_H */

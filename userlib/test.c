@@ -136,6 +136,44 @@ run_consumer(void)
 }
 
 /*
+ * run_consumer_direct — Phase D consumer: receives via sfc7120_rx_direct
+ * (userspace consumes + re-posts the RX ring, kernel out of the data path)
+ * instead of the SFC7120_RX ioctl. Verify against the kernel TX path:
+ * run `sfctest tx` on PF0 as the producer; each frame should arrive here.
+ */
+static int
+run_consumer_direct(void)
+{
+    sfc7120_if_t sfc = { .dev_path = DEV_PF1 };
+    uint8_t      frame[SFC7120_RX_BUFFER_SIZE];
+
+    if (sfc7120_init(&sfc) != 0) {
+        fprintf(stderr, "test: direct consumer init failed\n");
+        return 1;
+    }
+    printf("test: direct consumer up on %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+           DEV_PF1, sfc.mac_addr[0], sfc.mac_addr[1], sfc.mac_addr[2],
+           sfc.mac_addr[3], sfc.mac_addr[4], sfc.mac_addr[5]);
+    dump_vi_state(&sfc);
+    printf("test: direct RX from rx_head=%u (start `sfctest tx` on PF0)\n",
+           sfc.rx_head);
+
+    for (int i = 0; i < TEST_PACKETS; i++) {
+        size_t len = 0;
+        if (sfc7120_rx_direct(&sfc, frame, &len) != 0) {
+            fprintf(stderr, "test: direct RX %d failed\n", i);
+            break;
+        }
+        printf("test: direct RX %d ok (%zu bytes, payload marker 0x%02x)\n",
+               i, len, len > 14 ? frame[14] : 0);
+    }
+
+    sfc7120_destroy(&sfc);
+    printf("test: direct consumer done\n");
+    return 0;
+}
+
+/*
  * run_poller — Phase C consumer: drains the data EVQ directly via
  * sfc7120_poll (zero syscalls in the poll loop) instead of the SFC7120_RX
  * ioctl. The kernel still owns descriptor posting; we only observe + ack
@@ -193,16 +231,18 @@ int
 main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s tx|rx|poll\n", argv[0]);
+        fprintf(stderr, "usage: %s tx|rx|rxd|poll\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "tx") == 0)
         return run_producer();
     if (strcmp(argv[1], "rx") == 0)
         return run_consumer();
+    if (strcmp(argv[1], "rxd") == 0)
+        return run_consumer_direct();
     if (strcmp(argv[1], "poll") == 0)
         return run_poller();
 
-    fprintf(stderr, "usage: %s tx|rx|poll\n", argv[0]);
+    fprintf(stderr, "usage: %s tx|rx|rxd|poll\n", argv[0]);
     return 2;
 }
