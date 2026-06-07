@@ -15,25 +15,23 @@ CAPIO driver stack. Contains two components that live together in this repo:
   phase 3 removes the kernel from the data path entirely via direct EVQ
   polling.
 
-**Status: ATTACHES CLEANLY WITH QUEUES INITIALIZED (as of 2026-05-18).**
-The PCI driver, CAPIO wiring, IOCTL dispatch, slice manifest, MCDI
-transport (v1 + v2 framing), identity bringup (`GET_VERSION` /
-`DRV_ATTACH` / `GET_MAC` / `GET_PORT_ASSIGNMENT` / `GET_FUNCTION_INFO` /
-`GET_CAPABILITIES`), per-function reset (`ENTITY_RESET`), assertion
-clearing (`GET_ASSERTS`), VI allocation (`ALLOC_VIS` — 32 VIs at base
-1024 on PF1, base 1 on PF0), vAdaptor allocation
-(`VADAPTOR_ALLOC` on `EVB_PORT_ID_ASSIGNED` with `PERMIT_SET_MAC_*`
-cap-gated), and per-queue init (`INIT_EVQ` / `INIT_RXQ` / `INIT_TXQ` —
-512 descriptors each, all targeting EVQ 0) all succeed. The DMA mailbox,
-DMA rings + packet buffers, cdev creation, smem population, and
-`init_capio_sc` complete end-to-end; both PF0 and PF1 reach `sfc7120pol
-attached`.
+**Status: END-TO-END TRAFFIC OVER THE DIRECT (KERNEL-BYPASS) DATA PATH
+(as of 2026-06-07).** Full bringup (PCI/CAPIO/IOCTL/slice manifest, MCDI v1+v2,
+identity, `ENTITY_RESET`, `ALLOC_VIS`, `VADAPTOR_ALLOC`) plus **two EVQs**
+(EVQ 0 control/interrupting + kernel ISR; EVQ 1 data/non-interrupting carrying
+TX/RX completions), **MAC reconfigure + link bring-up + RX filters** (link UP,
+frames flow PF0→PF1 over a DAC cable), the **kernel TX/RX ioctl handlers** (the
+verified data-path oracle), and the **userspace ef_vi direct path** in
+`userlib/` all work. The userspace data path is now: `sfc7120_tx_post` submits,
+`sfc7120_rx_recv` reads + recycles, and `sfc7120_poll` is the single EVQ reader
+harvesting both completion types — zero syscalls, kernel out of the hot path
+(`userlib/` Phases A–F done). See `userlib/CLAUDE.md` for the userspace roadmap.
 
-Still **TODO**: MAC reconfiguration + link bring-up
-(`MC_CMD_SET_MAC` / `MC_CMD_SET_LINK`), TX/RX IOCTL bodies, in-tree
-copy at `~/cheri/cheribsd/sys/modules/sfc7120pol/`, userspace driver at
-`userlib/sfc7120_user.c` in this repo (hand-rolled Ethernet/IP/UDP, no
-lwIP dependency; phase 1 via ioctls, phase 3 direct EVQ polling).
+Still **TODO**: Phase G (low-latency tuning + CHERI security validation —
+out-of-slice doorbell traps, descriptor bus-address bounds, PF isolation,
+latency benchmark) and the in-tree copy at
+`~/cheri/cheribsd/sys/modules/sfc7120pol/` (+ syncing the local `capio.c` /
+`capio.h`).
 
 ---
 
@@ -652,12 +650,14 @@ is kernel-owned. Corrected + hardware-verified 2026-06-03 (Phase B).
 | EVQ init | Done | `MC_CMD_INIT_EVQ (0x80)` programs EVQ 0 with 512 entries, flags `0x39`, ring at `sc->evq_ring_paddr`. `fini_evq` is called in teardown. |
 | RXQ init | Done | `MC_CMD_INIT_RXQ (0x81)` programs RXQ 0 → EVQ 0, 512 descriptors, flags `0x300`, ring at `sc->rx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
 | TXQ init | Done | `MC_CMD_INIT_TXQ (0x82)` programs TXQ 0 → EVQ 0, 512 descriptors, flags `0x06`, ring at `sc->tx_desc_ring_paddr`, `PORT_ID = EVB_PORT_ID_ASSIGNED`. |
-| MAC reconfigure / link bring | **TODO** | `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE` and `MC_CMD_SET_LINK` not yet issued; the interface won't pass traffic until they are. |
-| Interrupt handler | **Not planned** | MSI-X interrupt path not used — userspace drives TX/RX via ioctls (phase 1) then direct EVQ polling (phase 3). |
-| TX/RX IOCTLs (`SFC7120_TX`, `SFC7120_RX`) | **TODO** | Return ENOSYS today |
+| MAC reconfigure / link bring | Done | `MC_CMD_SET_MAC` / `MC_CMD_SET_LINK` issued; link comes UP and frames flow PF0→PF1 over a DAC cable. RX filters installed. |
+| Two EVQs | Done | EVQ 0 control/interrupting (kernel ISR owns it: link/MCDI/error events); EVQ 1 data/non-interrupting (carries TX/RX completions, driven by the data path). |
+| Interrupt handler | Done (control EVQ) | MSI-X ISR walks EVQ 0 for control events. The **data** path (EVQ 1) is polled, not interrupt-driven — userspace `sfc7120_poll`. |
+| TX/RX IOCTLs (`SFC7120_TX`, `SFC7120_RX`) | Done | The verified data-path oracle: copy, descriptor, doorbell, EVQ poll, 14-byte RX prefix. Kept as fallback now that the userspace direct path works. |
+| `SFC7120_GET_VI_INFO` / `SFC7120_SET_EVQ_RPTR` | Done | Hand userspace the VI geometry (PAs, instances, head pointers) at init; sync the direct-path pointers (`evq_read_ptr`/`tx_head`/`rx_head`) back at teardown. |
 | `SFC7120_GET_MAC` | Done | Returns `sc->mac_addr` populated by `MC_CMD_GET_MAC_ADDRESSES`. |
-| In-tree copy | Not yet | Add to `~/cheri/cheribsd/sys/modules/sfc7120pol/` once queue init lands. |
-| Userspace counterpart | In progress | `userlib/sfc7120_user.c` in this repo. Hand-rolled Ethernet/IP/UDP, no lwIP. Phase 1 via ioctls, phase 3 direct EVQ polling. |
+| In-tree copy | Not yet | Add to `~/cheri/cheribsd/sys/modules/sfc7120pol/` (+ sync local `capio.c`/`capio.h`). |
+| Userspace counterpart | Phases A–F done | `userlib/` direct ef_vi path: `tx_post`/`rx_recv` + single-reader `sfc7120_poll`, kernel out of the data path. Phase G (tuning + CHERI security tests) remains. See `userlib/CLAUDE.md`. |
 
 ---
 
@@ -688,21 +688,20 @@ ring DMA addresses come from `sfc7120_alloc_dma_resources`. (We did
 for this firmware variant — `INIT_*Q` accepted the ring paddrs
 directly.) Reference: `ef10_ev.c`, `ef10_rx.c`, `ef10_tx.c` in sfxge.
 
-🔜 **MAC config + link bring** — `MC_CMD_SET_MAC` / `MC_CMD_MAC_RECONFIGURE`,
-`MC_CMD_SET_LINK`, `MC_CMD_GET_LINK` to confirm.
+✅ **MAC config + link bring** — `MC_CMD_SET_MAC` / `MC_CMD_SET_LINK` issued;
+link UP, frames flow PF0→PF1 over a DAC cable, RX filters installed.
 
-🔜 **Interrupt handler** — MSI-X allocation, EVQ event walking. The
-`sfc7120_interrupt_handler` and `sfc7120_rx_task_handler` skeletons
-already exist (currently unused, hence the `-Wunused-function`
-warnings during build — those will go away once they're wired).
+✅ **Interrupt handler (control EVQ)** — MSI-X ISR walks EVQ 0 for control
+events. The data EVQ (1) is polled by userspace, not interrupt-driven.
 
-🔜 **TX/RX IOCTLs** — kernel-mediated fallback paths for testing before
-the userspace driver lands.
+✅ **TX/RX IOCTLs** — `SFC7120_TX`/`SFC7120_RX` implemented (copy, descriptor,
+doorbell, EVQ poll, RX prefix). The verified data-path oracle; kept as the
+userspace fallback.
 
-🔜 **Userspace driver** — `userlib/sfc7120_user.c` in this repo.
-Hand-rolled Ethernet/IP/UDP frames written directly into the mmapped TX
-buffer. No lwIP dependency. Phase 1: TX/RX via ioctls. Phase 3: direct
-EVQ polling + doorbell writes through MMIO slice, kernel out of data path.
+✅ **Userspace driver** — `userlib/sfc7120_user.c`. Direct ef_vi path complete
+(Phases A–F): `tx_post`/`rx_recv` + single-reader `sfc7120_poll`, zero-syscall,
+kernel out of the data path. Phase G (tuning + CHERI security tests) remains.
+See `userlib/CLAUDE.md`.
 
 🔜 **In-tree copy** — once stable, copy under
 `~/cheri/cheribsd/sys/modules/sfc7120pol/` so it builds into the

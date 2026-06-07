@@ -91,9 +91,14 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
 int  sfc7120_init(sfc7120_if_t *sfc);
 void sfc7120_destroy(sfc7120_if_t *sfc);
 int  sfc7120_tx(sfc7120_if_t *sfc, const void *buf, size_t len);
-int  sfc7120_tx_direct(sfc7120_if_t *sfc, const void *buf, size_t len);
 int  sfc7120_rx(sfc7120_if_t *sfc, void *buf, size_t *len_out);
-int  sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out);
 int  sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs);
+
+/* Phase F direct data path: tx_post + rx_recv submit/handle, poll is the sole
+ * EVQ reader. tx_post returns immediately (completion arrives as a poll TX_EV);
+ * rx_recv reads + recycles the current slot on a poll RX_EV (no EVQ access). */
+int  sfc7120_tx_post(sfc7120_if_t *sfc, const void *buf, size_t len);
+int  sfc7120_rx_recv(sfc7120_if_t *sfc, void *buf, size_t *len_out,
+                     uint16_t rx_bytes);
 
 #endif /* SFC7120_USER_H */

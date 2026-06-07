@@ -354,84 +354,39 @@ sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs)
 }
 
 /*
- * sfc7120_rx_direct — receive one packet straight from the mapped rings, with
- * the kernel out of the data path (Phase D). This is the userspace mirror of
- * the kernel SFC7120_RX handler (../sfc7120.c): identical event decode,
- * 14-byte RX-prefix handling, and descriptor re-post — only the rings and
- * doorbells are touched directly through CHERI capabilities, not via ioctl.
+ * sfc7120_rx_recv — read + recycle one received packet (Phase F). Called by
+ * the application *after* sfc7120_poll reports an RX_EV; it does NOT touch the
+ * data EVQ (poll already consumed and acked that event). It reads the current
+ * rx_head buffer slot (stripping the 14-byte EF10 prefix, length at +8 with a
+ * fallback to the event byte count), then re-posts that descriptor and rings
+ * the RX doorbell so the NIC can reuse the slot.
  *
- * Blocking: spins the data EVQ (instance 1) until an RX_EV arrives or the
- * wait budget runs out. On success copies the frame (prefix stripped) into
- * buf, sets *len_out to the frame length, returns 0; returns -1 on timeout
- * or bad arguments.
+ * `rx_bytes` is the byte count from the poll RX_EV (evs[i].rx_bytes), used
+ * only as the cut-through-mode length fallback. Returns 0 on success, -1 on
+ * bad arguments.
  *
- * Single-owner contract: nothing else may consume this PF's data EVQ while
- * direct RX runs — no kernel SFC7120_RX/TX ioctls on this fd. See the
- * two-owner discussion in ../CLAUDE.md.
+ * Owns the RX ring + RX doorbell + rx_head; poll owns the EVQ. One owner per
+ * resource — see ../CLAUDE.md.
  */
 int
-sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
+sfc7120_rx_recv(sfc7120_if_t *sfc, void *buf, size_t *len_out, uint16_t rx_bytes)
 {
-    /* --- Step 0: guards + claim EVQ ownership for this session --- */
     if (sfc == NULL || buf == NULL)
         return -1;
-    if (sfc->evq_ring == NULL || sfc->rx_desc_ring == NULL ||
-        sfc->rx_buffer == NULL || sfc->mmio_slices == NULL ||
-        sfc->mmio_slices_len <= SFC7120_SLICE_DATA_EVQ_RPTR_DBL)
+    if (sfc->rx_buffer == NULL || sfc->rx_desc_ring == NULL ||
+        sfc->mmio_slices == NULL ||
+        sfc->mmio_slices_len <= SFC7120_SLICE_RX_DESC_DBL)
         return -1;
 
-    /* We drive the data EVQ from userspace this session, so destroy must
-     * sync our read pointer back to the kernel (gated on used_poll). */
+    /* RX ring head advanced here is direct-path state the kernel needs synced
+     * back at destroy (gated on used_poll). */
     sfc->used_poll = true;
 
-    volatile uint64_t *evq     = (volatile uint64_t *)sfc->evq_ring;
     volatile uint64_t *rx_ring = (volatile uint64_t *)sfc->rx_desc_ring;
     uint8_t           *rxbuf   = (uint8_t *)sfc->rx_buffer;
 
-    /* --- Step 1: poll the data EVQ for an RX_EV (EV_CODE nibble == 0) ---
-     * Consume every event we pass (zero the slot, advance the read pointer),
-     * exactly as the kernel handler does. The budget is generous so a human
-     * can start the producer in another window. */
-    int      rx_found = 0;
-    int      consumed = 0;
-    uint32_t rx_bytes = 0;
-    const long RX_WAIT_BUDGET = 2000000000L;
-
-    for (long tries = 0; tries < RX_WAIT_BUDGET && !rx_found; tries++) {
-        uint64_t ev = evq[sfc->evq_read_ptr];
-
-        /* All-ones (never written) or zero (already consumed) = empty. */
-        if (ev == 0xffffffffffffffffULL || ev == 0)
-            continue;
-
-        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
-        if (code == 0) {            /* RX_EV */
-            rx_bytes = (uint32_t)(ev & 0x3fff);
-            rx_found = 1;
-        }
-
-        /* Consume regardless of type (startup/TX events drained too). */
-        evq[sfc->evq_read_ptr] = 0;
-        sfc->evq_read_ptr =
-            (sfc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-        consumed++;
-    }
-
-    /* --- Step 2: ack consumed events on the EVQ-1 RPTR doorbell (0x2400) --- */
-    if (consumed > 0) {
-        __asm__ volatile("dsb sy" ::: "memory");
-        *(volatile uint32_t * __capability)
-            sfc->mmio_slices[SFC7120_SLICE_DATA_EVQ_RPTR_DBL].addr =
-            sfc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK;
-    }
-
-    if (!rx_found)
-        return -1;                  /* timed out waiting for a packet */
-
-    /* --- Step 3: read the packet from the RX buffer slot ---
-     * Strip the 14-byte EF10 prefix; frame length is the LE uint16 at prefix
-     * offset +8. If that reads 0 (cut-through), derive from the event byte
-     * count. Mirrors the kernel exactly. */
+    /* Read the packet: strip the 14-byte EF10 prefix; frame length is the LE
+     * uint16 at prefix offset +8. If 0 (cut-through), derive from rx_bytes. */
     uint8_t *slot = rxbuf + (size_t)sfc->rx_head * SFC7120_RX_BUFFER_SIZE;
     uint16_t plen = (uint16_t)slot[8] | ((uint16_t)slot[9] << 8);
     if (plen == 0)
@@ -442,9 +397,8 @@ sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
     if (len_out != NULL)
         *len_out = plen;
 
-    /* --- Step 4: re-post this slot's descriptor so the NIC can reuse it ---
-     * 8-byte RX descriptor: BYTE_CNT (buffer capacity) in bits[61:48], bus
-     * address split across bits[47:32] (high 16) and bits[31:0] (low 32). */
+    /* Re-post this slot's descriptor (8-byte RX descriptor: BYTE_CNT in
+     * bits[61:48], bus addr high 16 in [47:32], low 32 in [31:0]). */
     uint64_t slot_pa = sfc->vi_info.rx_buffer_paddr +
                        (uint64_t)sfc->rx_head * SFC7120_RX_BUFFER_SIZE;
     rx_ring[sfc->rx_head] =
@@ -452,11 +406,9 @@ sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
         ((uint64_t)((slot_pa >> 32) & 0xffff)         << 32) |
         ((uint64_t)(slot_pa & 0xffffffff));
 
-    /* --- Step 5: ring the RX producer doorbell, then advance rx_head ---
-     * Mirror the kernel verbatim: write the current rx_head as the producer
-     * pointer. (8-descriptor-aligned batched re-post is a Phase G tuning
-     * item; match the proven oracle first.) dsb sy orders the descriptor
-     * store before the doorbell kick. */
+    /* dsb sy orders the descriptor store before the doorbell kick; ring the
+     * RX producer doorbell (rx_head verbatim — 8-aligned batching is Phase G);
+     * then advance rx_head. */
     __asm__ volatile("dsb sy" ::: "memory");
     *(volatile uint32_t * __capability)
         sfc->mmio_slices[SFC7120_SLICE_RX_DESC_DBL].addr = sfc->rx_head;
@@ -466,46 +418,41 @@ sfc7120_rx_direct(sfc7120_if_t *sfc, void *buf, size_t *len_out)
 }
 
 /*
- * sfc7120_tx_direct — transmit one packet straight from the mapped rings, with
- * the kernel out of the data path (Phase E). The userspace mirror of the
- * kernel SFC7120_TX handler (../sfc7120.c): identical descriptor layout,
- * WPTR-only doorbell push, and TX_EV completion match — only the rings and
- * doorbells are touched directly through CHERI capabilities, not via ioctl.
+ * sfc7120_tx_post — submit one packet for transmit and return immediately
+ * (Phase F). Copies the packet into the TX buffer slot, writes the descriptor,
+ * rings the WPTR-only doorbell, advances tx_head. Does NOT wait for the TX
+ * completion — that arrives later as a TX_EV from sfc7120_poll, the single
+ * EVQ reader. Returns 0 on success, -1 on bad arguments.
  *
- * Blocking: posts the descriptor, then spins the data EVQ (instance 1) for
- * the matching TX completion. Returns 0 on success, -1 on bad arguments or
- * if the completion never arrives.
- *
- * Single-owner contract: nothing else may consume this PF's data EVQ while
- * direct TX runs — no kernel SFC7120_TX/RX ioctls on this fd.
+ * Owns the TX ring + TX doorbell + tx_head; poll owns the EVQ. One owner per
+ * resource — see ../CLAUDE.md.
  */
 int
-sfc7120_tx_direct(sfc7120_if_t *sfc, const void *buf, size_t len)
+sfc7120_tx_post(sfc7120_if_t *sfc, const void *buf, size_t len)
 {
-    /* --- Step 0: guards + claim EVQ ownership for this session --- */
     if (sfc == NULL || buf == NULL)
         return -1;
     if (sfc->tx_buffer == NULL || sfc->tx_desc_ring == NULL ||
-        sfc->evq_ring == NULL || sfc->mmio_slices == NULL ||
+        sfc->mmio_slices == NULL ||
         sfc->mmio_slices_len <= SFC7120_SLICE_TX_DESC_DBL)
         return -1;
     if (len == 0 || len > SFC7120_TX_BUFFER_SIZE)
         return -1;
 
+    /* TX ring head advanced here is direct-path state the kernel needs synced
+     * back at destroy (gated on used_poll). */
     sfc->used_poll = true;
 
-    volatile uint64_t *evq     = (volatile uint64_t *)sfc->evq_ring;
     volatile uint64_t *tx_ring = (volatile uint64_t *)sfc->tx_desc_ring;
     uint8_t           *txbuf   = (uint8_t *)sfc->tx_buffer;
 
-    /* --- Step 1: copy the packet into the TX buffer slot --- */
+    /* Copy the packet into the TX buffer slot. */
     uint8_t *slot = txbuf + (size_t)sfc->tx_head * SFC7120_TX_BUFFER_SIZE;
     memcpy(slot, buf, len);
 
-    /* --- Step 2: build the 8-byte TX descriptor (kernel layout verbatim) ---
-     * bits[61:48] BYTE_CNT (packet length), bits[47:32] bus addr high 16,
-     * bits[31:0] bus addr low 32. TYPE/CONT (bits 63/62) = 0 (kernel desc,
-     * end-of-packet). */
+    /* Build the 8-byte TX descriptor (kernel layout verbatim): bits[61:48]
+     * BYTE_CNT (packet length), bits[47:32] bus addr high 16, bits[31:0] bus
+     * addr low 32. TYPE/CONT (bits 63/62) = 0 (kernel desc, end-of-packet). */
     uint64_t slot_pa = sfc->vi_info.tx_buffer_paddr +
                        (uint64_t)sfc->tx_head * SFC7120_TX_BUFFER_SIZE;
     tx_ring[sfc->tx_head] =
@@ -513,54 +460,16 @@ sfc7120_tx_direct(sfc7120_if_t *sfc, const void *buf, size_t len)
         ((uint64_t)((slot_pa >> 32) & 0xffff) << 32) |
         ((uint64_t)(slot_pa & 0xffffffff));
 
-    /* --- Step 3: ring the TX doorbell (WPTR-only push at slice +8 = 0xa18) ---
-     * dsb sy orders the packet + descriptor stores before the doorbell kick.
-     * The TX_DESC_DBL slice is 12 bytes; dword index [2] is byte offset +8. */
-    int      posted_idx = sfc->tx_head;
+    /* dsb sy orders the packet + descriptor stores before the doorbell kick;
+     * WPTR-only push at slice +8 = 0xa18 (TX_DESC_DBL slice dword index [2]);
+     * then advance tx_head. */
     uint32_t wptr = (uint32_t)(sfc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
     __asm__ volatile("dsb sy" ::: "memory");
     ((volatile uint32_t * __capability)
         sfc->mmio_slices[SFC7120_SLICE_TX_DESC_DBL].addr)[2] = wptr;
-
-    /* --- Step 4: poll the data EVQ for our TX completion ---
-     * TX_EV = code 2, TX_DESCR_INDX in bits[15:0]. Consume every event we
-     * pass (zero slot, advance read pointer); done when comp_idx matches the
-     * descriptor we just posted. Exact-match mirrors the kernel oracle. */
-    int      tx_done  = 0;
-    int      consumed = 0;
-    const long TX_WAIT_BUDGET = 100000000L;
-
-    for (long tries = 0; tries < TX_WAIT_BUDGET && !tx_done; tries++) {
-        uint64_t ev = evq[sfc->evq_read_ptr];
-
-        if (ev == 0xffffffffffffffffULL || ev == 0)
-            continue;
-
-        uint32_t code = (uint32_t)(ev >> 60) & 0xf;
-        if (code == 2) {            /* TX_EV */
-            uint32_t comp_idx = (uint32_t)(ev & 0xffff);
-            if (comp_idx == (uint32_t)posted_idx)
-                tx_done = 1;
-        }
-
-        evq[sfc->evq_read_ptr] = 0;
-        sfc->evq_read_ptr =
-            (sfc->evq_read_ptr + 1) & (SFC7120_NUM_EVQ_ENTRY - 1);
-        consumed++;
-    }
-
-    /* --- Step 5: ack consumed events on the EVQ-1 RPTR doorbell (0x2400) --- */
-    if (consumed > 0) {
-        __asm__ volatile("dsb sy" ::: "memory");
-        *(volatile uint32_t * __capability)
-            sfc->mmio_slices[SFC7120_SLICE_DATA_EVQ_RPTR_DBL].addr =
-            sfc->evq_read_ptr & SFC7120_EVQ_RPTR_MASK;
-    }
-
-    /* --- Step 6: advance tx_head --- */
     sfc->tx_head = (sfc->tx_head + 1) & (SFC7120_NUM_TX_DESC - 1);
 
-    return tx_done ? 0 : -1;
+    return 0;
 }
 
 void

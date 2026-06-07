@@ -106,10 +106,10 @@ run_producer(void)
 }
 
 /*
- * run_producer_direct — Phase E producer: transmits via sfc7120_tx_direct
- * (userspace posts the descriptor + rings the doorbell + polls the TX_EV,
- * kernel out of the data path) instead of the SFC7120_TX ioctl. Pair with
- * `sfctest rxd` on PF1 for a full direct-path dual-port test.
+ * run_producer_direct — Phase F producer: submits the batch via
+ * sfc7120_tx_post (returns immediately, no per-packet wait), then harvests TX
+ * completions through sfc7120_poll — the single EVQ reader. Kernel out of the
+ * data path. Pair with `sfctest rxd` on PF1 for a full direct dual-port test.
  */
 static int
 run_producer_direct(void)
@@ -131,19 +131,38 @@ run_producer_direct(void)
     memcpy(dst, sfc.mac_addr, 6);
     dst[5] += 1;
 
+    /* Submit the whole batch — tx_post returns immediately (no per-packet
+     * wait). Each call copies the frame into its own TX slot, so reusing the
+     * local frame buffer between iterations is safe. */
     for (int i = 0; i < TEST_PACKETS; i++) {
         build_frame(frame, dst, sfc.mac_addr, i);
-        if (sfc7120_tx_direct(&sfc, frame, FRAME_LEN) != 0) {
-            fprintf(stderr, "test: direct TX %d failed\n", i);
+        if (sfc7120_tx_post(&sfc, frame, FRAME_LEN) != 0) {
+            fprintf(stderr, "test: direct TX post %d failed\n", i);
             sfc7120_destroy(&sfc);
             return 1;
         }
-        printf("test: direct TX %d ok (%d bytes)\n", i, FRAME_LEN);
+        printf("test: direct TX %d posted (%d bytes)\n", i, FRAME_LEN);
+    }
+
+    /* Harvest TX completions through poll — the sole EVQ reader. */
+    sfc7120_ev_t evs[8];
+    int  done = 0;
+    long tries = 0;
+    while (done < TEST_PACKETS && tries++ < 2000000000L) {
+        int n = sfc7120_poll(&sfc, evs, 8);
+        if (n < 0) {
+            fprintf(stderr, "test: poll failed\n");
+            break;
+        }
+        for (int j = 0; j < n; j++)
+            if (evs[j].type == SFC7120_EV_TX)
+                printf("test: TX complete (desc %u) %d/%d\n",
+                       evs[j].tx_desc_idx, ++done, TEST_PACKETS);
     }
 
     sfc7120_destroy(&sfc);
-    printf("test: direct producer done\n");
-    return 0;
+    printf("test: direct producer done (%d/%d completed)\n", done, TEST_PACKETS);
+    return done == TEST_PACKETS ? 0 : 1;
 }
 
 static int
@@ -177,10 +196,9 @@ run_consumer(void)
 }
 
 /*
- * run_consumer_direct — Phase D consumer: receives via sfc7120_rx_direct
- * (userspace consumes + re-posts the RX ring, kernel out of the data path)
- * instead of the SFC7120_RX ioctl. Verify against the kernel TX path:
- * run `sfctest tx` on PF0 as the producer; each frame should arrive here.
+ * run_consumer_direct — Phase F consumer: poll is the sole EVQ reader; each
+ * RX_EV it returns is handed to sfc7120_rx_recv to read + recycle the slot.
+ * Kernel out of the data path. Run `sfctest tx` or `sfctest txd` on PF0.
  */
 static int
 run_consumer_direct(void)
@@ -199,19 +217,36 @@ run_consumer_direct(void)
     printf("test: direct RX from rx_head=%u (start `sfctest tx` on PF0)\n",
            sfc.rx_head);
 
-    for (int i = 0; i < TEST_PACKETS; i++) {
-        size_t len = 0;
-        if (sfc7120_rx_direct(&sfc, frame, &len) != 0) {
-            fprintf(stderr, "test: direct RX %d failed\n", i);
+    /* poll is the only EVQ reader; dispatch each RX_EV to rx_recv (read +
+     * recycle the slot). TX_EVs would be handled here too in a full-duplex
+     * app; this consumer only expects RX. */
+    sfc7120_ev_t evs[8];
+    int  got   = 0;
+    long tries = 0;
+    while (got < TEST_PACKETS && tries++ < 2000000000L) {
+        int n = sfc7120_poll(&sfc, evs, 8);
+        if (n < 0) {
+            fprintf(stderr, "test: poll failed\n");
             break;
         }
-        printf("test: direct RX %d ok (%zu bytes, payload marker 0x%02x)\n",
-               i, len, len > 14 ? frame[14] : 0);
+        for (int j = 0; j < n; j++) {
+            if (evs[j].type != SFC7120_EV_RX)
+                continue;
+            size_t len = 0;
+            if (sfc7120_rx_recv(&sfc, frame, &len, evs[j].rx_bytes) != 0) {
+                fprintf(stderr, "test: rx_recv failed\n");
+                tries = 2000000000L;   /* bail out of the wait loop */
+                break;
+            }
+            printf("test: direct RX %d ok (%zu bytes, payload marker 0x%02x)\n",
+                   got, len, len > 14 ? frame[14] : 0);
+            got++;
+        }
     }
 
     sfc7120_destroy(&sfc);
-    printf("test: direct consumer done\n");
-    return 0;
+    printf("test: direct consumer done (%d/%d received)\n", got, TEST_PACKETS);
+    return got == TEST_PACKETS ? 0 : 1;
 }
 
 /*

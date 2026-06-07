@@ -109,18 +109,24 @@ register, each bounded to exactly that register.
 
 ---
 
-## Current State (as of 2026-06-05)
+## Current State (as of 2026-06-07)
 
-**Phase 1 (ioctl path) works; Phase C (direct EVQ polling) is done,
-hardware-verified.** Userspace maps **all six regions** (TX/RX packet
+**The full direct data path works, kernel out of the hot path (Phases A–F
+done, hardware-verified).** Userspace maps **all six regions** (TX/RX packet
 buffers, TX/RX desc rings, data-EVQ ring, sliced MMIO) and reads `GET_VI_INFO`
-at init; MMIO *reads* through slice caps work (`HW_REV_ID = 0xeb14face` —
-required the `VM_MEMATTR_DEVICE` capio fix, see Gotcha 9); teardown is
-clean (repeated runs on one PF, no module reload — required the
-munmap-in-destroy rework, see Gotcha 10); and `sfc7120_poll` drains the data
-EVQ with zero syscalls (`sfctest poll` sees 4/4 RX events vs the kernel TX
-path). Descriptor posting is still the ioctls — Phases D–F move it to
-userspace.
+at init; MMIO reads through slice caps work (`HW_REV_ID = 0xeb14face` — the
+`VM_MEMATTR_DEVICE` capio fix, Gotcha 9); teardown is clean across repeated
+runs (munmap-in-destroy rework, Gotcha 10). The data path is now:
+`sfc7120_tx_post` submits, `sfc7120_rx_recv` reads + recycles, and
+**`sfc7120_poll` is the single EVQ reader** that harvests both TX and RX
+completions — zero syscalls in the loop. `sfctest txd → rxd` passes dual-port,
+end-to-end, with the kernel touching nothing in the data path. The ioctl
+`tx`/`rx` remain as the fallback oracle.
+
+Remaining: **Phase G** — low-latency tuning (TX inline-push, 8-aligned batched
+RX re-post, TX-completion delta-counting for coalescing, barrier minimization)
+and the **CHERI security validation** (out-of-slice doorbell traps, descriptor
+bus-address bounds, PF0/PF1 isolation) + latency benchmark. See the roadmap.
 
 **Phase 1 (ioctl path) works.** `test.c` (`sfctest`) sends frames PF0→PF1 over a
 DAC cable and receives them, today. That path is:
@@ -328,31 +334,52 @@ oddity of 1→2→4→4→5 is a printf artifact: test.c prints the live shared 
 after a batched poll — not a logic bug.) HW_REV_ID slice read verified
 2026-06-04; the out-of-slice trap test moves to Phase G.
 
-### 🔜 Phase D — Userspace: direct RX (post + doorbell)
-Pre-post RX descriptors into the mapped `rx_desc_ring`
-(`BUF_ADDR = rx_buffer_paddr + slot*2048`, `BYTE_CNT = 2048`), ring
-`RX_DESC_UPD` with an 8-aligned wptr. On RX_EV: read from the RX buffer slot
-(strip the 14-byte prefix, length at +8, exactly as the kernel does), re-post the
-descriptor, ring the doorbell.
-**Verify:** `sfctest rx` receives PF0→PF1 frames with the direct RX path and the
-kernel TX path.
+### ✅ Phase D — Userspace: direct RX (post + doorbell) (done 2026-06-07)
+`sfc7120_rx_direct` (later refactored into `sfc7120_rx_recv`, see Phase F)
+read the current `rx_head` slot (strip 14-byte prefix, length at +8 with a
+cut-through fallback to the event byte count), re-posted the descriptor, rang
+`RX_DESC_DBL`, advanced `rx_head` — all ported verbatim from the kernel
+`SFC7120_RX` handler. New `rx_head` field in `sfc7120_if_t`, seeded from
+`vi_info.rx_head`. (8-aligned batched re-post deferred to Phase G — matched the
+proven oracle first.)
+**Verified on hardware (2026-06-07):** `sfctest rxd` (PF1) receives PF0→PF1
+frames against the kernel TX path (`sfctest tx`), matching the ioctl `rx`
+oracle.
 
-### 🔜 Phase E — Userspace: direct TX (post + doorbell)
-Build the 8-byte TX descriptor in the mapped `tx_desc_ring`
-(`BUF_ADDR = tx_buffer_paddr + slot*2048`), copy the packet into the TX buffer
-slot, `dsb sy`, ring `TX_DESC_UPD` (push or WPTR-only — port the kernel's exact
-choice), then poll the EVQ for TX_EV. Port the kernel's descriptor build + push
-verbatim.
-**Verify:** `sfctest tx` transmits with the direct TX path; full direct RX+TX
-dual-port test passes.
+### ✅ Phase E — Userspace: direct TX (post + doorbell) (done 2026-06-07)
+`sfc7120_tx_direct` (later `sfc7120_tx_post`, see Phase F) copied the packet
+into the `tx_head` TX slot, built the 8-byte descriptor (kernel layout
+verbatim: `len<<48`), `dsb sy`, rang the WPTR-only push at the TX slice `+8`
+(`0xa18`, dword index `[2]`), advanced `tx_head`. New `tx_head` field, seeded
+from `vi_info.tx_head`.
+**Verified on hardware (2026-06-07):** `sfctest txd` (PF0) transmits to
+`sfctest rxd`/`rx` (PF1); full direct dual-port test passes.
 
-### 🔜 Phase F — Cutover
-`sfc7120_tx` / `sfc7120_rx` become zero-syscall direct ops; `sfc7120_poll` is the
-new public entry point for draining completions. Keep the ioctl path behind a
-runtime/compile flag as the fallback oracle. Dual-port `sfctest` passes
-end-to-end over the direct path; only then remove the ioctl data path.
-**Verify:** zero syscalls in the TX/RX/poll hot loop (confirm with `truss` /
-counters); dual-port test green.
+### ✅ Phase F — Cutover (done 2026-06-07)
+Single EVQ reader achieved. `sfc7120_tx_post` (submit only — completion comes
+later as a poll TX_EV) and `sfc7120_rx_recv` (read + recycle a slot on a poll
+RX_EV, no EVQ access) replaced the blocking `*_direct` wrappers; **all EVQ
+reading now happens only in `sfc7120_poll`.** Ownership is one-per-resource:
+poll→EVQ+RPTR, tx_post→TX ring+doorbell+`tx_head`, rx_recv→RX ring+doorbell+
+`rx_head`. This is what makes full-duplex on a single PF safe. The ioctl
+`sfc7120_tx`/`sfc7120_rx` remain as the fallback oracle.
+**Verified on hardware (2026-06-07):** `sfctest txd → rxd` green end-to-end via
+the post/poll path. NOTE: batched TX now exposes EF10 completion coalescing —
+the producer harvest counts one completion per TX_EV; if the NIC coalesces,
+switch to `tx_desc_idx` delta-counting (folded into Phase G).
+
+#### Cross-session pointer persistence — hard-won, do not regress
+`INIT_EVQ`/`INIT_RXQ`/`INIT_TXQ` run **once per module load, not per open**, so
+the NIC's EVQ read pointer and TX/RX ring positions **persist across userspace
+sessions**. The kernel softc holds the canonical `data_evq_read_ptr` /
+`tx_head` / `rx_head`; `GET_VI_INFO` seeds userspace from them at init, and
+`SFC7120_SET_EVQ_RPTR` (the "sync" ioctl) writes userspace's final values back
+at destroy — **gated on `used_poll`** (set by poll/tx_post/rx_recv). Two bugs
+came from getting this wrong: (1) syncing in the *ioctl-only* path clobbered the
+kernel's correct pointer with a stale seed; (2) *not* syncing `tx_head`/`rx_head`
+left every re-opened session re-seeding a stale value while the NIC marched on.
+Both fixed; the seam is "kernel owns the canonical pointers, userspace borrows
+and returns them only when it actually drove the data path."
 
 ### 🔜 Phase G — Low-latency tuning + CHERI security validation
 TX inline-push path, batched 8-aligned RX re-posting, barrier minimization
