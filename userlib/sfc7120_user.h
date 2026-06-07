@@ -63,6 +63,10 @@ typedef struct sfc7120_if { // state struct, everything we need from kernel stub
     sfc7120_vi_info_req_t vi_info; /* paddrs, vi_base, instances, counts, heads */
     bool     vi_info_valid;        /* GET_VI_INFO succeeded — gates rptr sync */
     uint32_t evq_read_ptr;         /* our data-EVQ read ptr (seeded from vi_info) */
+    bool     used_poll;            /* sfc7120_poll ran this session — only then
+                                    * is evq_read_ptr ours to sync back. In the
+                                    * ioctl-only path the kernel owns the EVQ
+                                    * pointer and must NOT be clobbered. */
 
     /* Per-region mapping record for munmap at destroy; indexed by
      * sfc7120_vm_map_type_t. For the sliced MMIO region, base is the

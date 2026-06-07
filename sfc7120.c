@@ -1067,6 +1067,16 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         volatile uint64_t *evq = (volatile uint64_t *)sc->data_evq_ring;
         int tx_done = 0;
         int consumed = 0;
+
+        /* --- one-shot TX timeout diagnostic (read-only) --- */
+        int      dbg_start_rptr = sc->data_evq_read_ptr;
+        int      dbg_evs_seen   = 0;   /* total non-empty events read */
+        int      dbg_tx_evs     = 0;   /* code==2 (TX_EV) seen */
+        int      dbg_rx_evs     = 0;   /* code==0 (RX_EV) seen */
+        int      dbg_other_evs  = 0;   /* anything else */
+        uint64_t dbg_first_ev   = 0;   /* raw word of the first event seen */
+        uint32_t dbg_last_txidx = 0xffffffffU; /* comp_idx of last TX_EV */
+
         for (int tries = 0; tries < 10000 && !tx_done; tries++) {
             bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
@@ -1077,11 +1087,23 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
                 continue;
 
             uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+
+            /* diagnostic tally (does not change consumption behavior) */
+            if (dbg_evs_seen == 0)
+                dbg_first_ev = ev;
+            dbg_evs_seen++;
+
             if (code == 2) { /* TX_EV */
                 uint32_t comp_idx = (uint32_t)(ev & 0xffff);
+                dbg_tx_evs++;
+                dbg_last_txidx = comp_idx;
                 if (comp_idx == (uint32_t)posted_idx) {
                     tx_done = 1;
                 }
+            } else if (code == 0) {
+                dbg_rx_evs++;
+            } else {
+                dbg_other_evs++;
             }
 
             /* Consume the event regardless — advance past it. */
@@ -1100,6 +1122,21 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
                             BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
             SFC7120_WRITE_REG(sc, SFC7120_REG_DATA_EVQ_RPTR_DBL,
                 (uint32_t)sc->data_evq_read_ptr & SFC7120_EVQ_RPTR_MASK);
+        }
+
+        /* On timeout, dump one line telling us WHY the completion never
+         * matched: did the NIC post nothing (evs_seen=0 → stopped posting),
+         * a non-matching TX_EV (tx>0, last_txidx != posted_idx → index/range
+         * bug), or stale RX_EVs we chewed through (rx>0 → shared-cursor
+         * cross-drain)? Read-only; remove once diagnosed. */
+        if (!tx_done) {
+            device_printf(sc->dev,
+                "TX TIMEOUT: posted_idx=%d rptr %d->%d consumed=%d "
+                "evs_seen=%d (tx=%d rx=%d other=%d) "
+                "first_ev=%#016jx last_tx_idx=%u\n",
+                posted_idx, dbg_start_rptr, sc->data_evq_read_ptr, consumed,
+                dbg_evs_seen, dbg_tx_evs, dbg_rx_evs, dbg_other_evs,
+                (uintmax_t)dbg_first_ev, dbg_last_txidx);
         }
 
         /* --- Step 6: advance tx_head --- */
@@ -1140,6 +1177,14 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         int    consumed = 0;
         uint32_t rx_bytes = 0;
 
+        /* --- one-shot RX timeout diagnostic (read-only) --- */
+        int      dbg_start_rptr = sc->data_evq_read_ptr;
+        int      dbg_evs_seen   = 0;   /* total non-empty events read */
+        int      dbg_tx_evs     = 0;   /* code==2 (TX_EV) seen */
+        int      dbg_rx_evs     = 0;   /* code==0 (RX_EV) seen */
+        int      dbg_other_evs  = 0;   /* anything else */
+        uint64_t dbg_first_ev   = 0;   /* raw word of the first event seen */
+
         for (int tries = 0; tries < 100000 && !rx_found; tries++) {
             bus_dmamap_sync(sc->data_evq_dtag, sc->data_evq_dmamap,
                             BUS_DMASYNC_POSTREAD);
@@ -1149,6 +1194,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
                 continue;
 
             uint32_t code = (uint32_t)(ev >> 60) & 0xf;
+
+            /* diagnostic tally (does not change consumption behavior) */
+            if (dbg_evs_seen == 0)
+                dbg_first_ev = ev;
+            dbg_evs_seen++;
+            if (code == 2)      dbg_tx_evs++;
+            else if (code == 0) dbg_rx_evs++;
+            else                dbg_other_evs++;
+
             if (code == 0) { /* RX_EV */
                 /* Extract byte count (includes 14-byte EF10 prefix). Trust
                  * rx_head as the slot — same approach as Finn's ISR path. */
@@ -1173,6 +1227,15 @@ sfc7120_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
         }
 
         if (!rx_found) {
+            /* Same triage as the TX path: evs_seen=0 → NIC posted nothing;
+             * tx>0 → we drained TX completions while waiting for an RX_EV
+             * that never came. Read-only; remove once diagnosed. */
+            device_printf(sc->dev,
+                "RX TIMEOUT: rx_head=%d rptr %d->%d consumed=%d "
+                "evs_seen=%d (tx=%d rx=%d other=%d) first_ev=%#016jx\n",
+                sc->rx_head, dbg_start_rptr, sc->data_evq_read_ptr, consumed,
+                dbg_evs_seen, dbg_tx_evs, dbg_rx_evs, dbg_other_evs,
+                (uintmax_t)dbg_first_ev);
             SFC7120_UNLOCK(sc);
             return ETIMEDOUT;
         }

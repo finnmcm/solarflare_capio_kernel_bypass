@@ -112,6 +112,7 @@ sfc7120_init(sfc7120_if_t *sfc)
     sfc->mmio_slices_len = 0;
     sfc->vi_info_valid   = false;
     sfc->evq_read_ptr    = 0;
+    sfc->used_poll       = false;
     memset(sfc->region_maps, 0, sizeof(sfc->region_maps));
 
     const char *dev = sfc->dev_path != NULL ? sfc->dev_path : DEVSFC7120;
@@ -292,6 +293,11 @@ sfc7120_poll(sfc7120_if_t *sfc, sfc7120_ev_t *evs, int max_evs)
         sfc->mmio_slices_len <= SFC7120_SLICE_DATA_EVQ_RPTR_DBL)
         return -1;
 
+    /* This session owns the EVQ read pointer from here on — record it so
+     * destroy syncs evq_read_ptr back to the kernel. Without a poll, the
+     * kernel's own pointer is authoritative and must be left alone. */
+    sfc->used_poll = true;
+
     volatile uint64_t *evq = (volatile uint64_t *)sfc->evq_ring;
     int n = 0;
 
@@ -369,9 +375,16 @@ sfc7120_destroy(sfc7120_if_t *sfc)
      * the next run's GET_VI_INFO (and any ioctl-path TX/RX on this load)
      * starts from the right slot — the direct poll path consumes events the
      * kernel never sees. Best-effort: a failure leaves the kernel stale
-     * (kldload recovers), but teardown must still proceed. Skipped if init
-     * never reached GET_VI_INFO. */
-    if (sfc->fd >= 0 && sfc->vi_info_valid) {
+     * (kldload recovers), but teardown must still proceed.
+     *
+     * ONLY when this session actually polled. In the ioctl-only path the
+     * kernel advances data_evq_read_ptr itself and our evq_read_ptr is just
+     * the stale init seed; syncing it would clobber the kernel pointer back
+     * to that seed. Because INIT_EVQ runs once per module load (not per
+     * open), the NIC's write pointer persists across sessions — so a clobber
+     * desyncs every TX/RX after the first re-open. Skipped if init never
+     * reached GET_VI_INFO, or if no poll ran. */
+    if (sfc->fd >= 0 && sfc->vi_info_valid && sfc->used_poll) {
         sfc7120_evq_sync_req_t sync_req;
         sync_req.user_cap     = sfc->cap_req.user_cap;
         sync_req.sealed_cap   = sfc->cap_req.sealed_cap;
