@@ -15,8 +15,25 @@
  */
 #include "sfc7120_user.h"
 
+#include <setjmp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+/* CHERI capability introspection via compiler builtins — avoids pulling in
+ * <cheri/cheric.h>, which transitively includes machine/vmparam.h and errors
+ * on the PAGE_SIZE define in sfc7120_user.h (include-order clash). */
+#define cheri_getbase(c)   __builtin_cheri_base_get((const void * __capability)(c))
+#define cheri_getlen(c)    __builtin_cheri_length_get((const void * __capability)(c))
+#define cheri_getoffset(c) __builtin_cheri_offset_get((const void * __capability)(c))
+#define cheri_getperm(c)   __builtin_cheri_perms_get((const void * __capability)(c))
+#define cheri_gettag(c)    __builtin_cheri_tag_get((const void * __capability)(c))
+
+#ifndef SIGPROT
+#define SIGPROT 34
+#endif
 
 #define DEV_PF0       "/dev/sfc7120pol0"
 #define DEV_PF1       "/dev/sfc7120pol1"
@@ -303,11 +320,206 @@ run_poller(void)
     return rx_seen == TEST_PACKETS ? 0 : 1;
 }
 
+/*
+ * ============================================================================
+ * Phase G — CHERI security validation
+ * ============================================================================
+ *
+ * `sfctest sec` deliberately commits three memory-safety violations against
+ * the bounded capabilities the kernel handed us and checks that each one traps
+ * in hardware (SIGPROT — CHERI capability fault) rather than corrupting the
+ * NIC, another VI, or kernel state:
+ *
+ *   1. Out-of-bounds access on a doorbell slice capability. The TX_DESC_DBL
+ *      slice is 12 bytes; we offset well past its bound and write. CHERI must
+ *      trap before the store reaches MMIO.
+ *   2. Buffer overflow past the TX packet-buffer capability. The buffer cap is
+ *      bounded to 1 MB (512 * 2048); we walk one byte past the end and write.
+ *   3. Ringing/advancing past the TX descriptor-ring capability. The ring cap
+ *      is 4 KB (512 * 8); we index one descriptor past the end and write.
+ *
+ * Each violation runs in a forked child so the expected SIGPROT terminates
+ * only the child; the parent reads the child's exit status and reports PASS
+ * (child died on a capability fault — the bound held) or FAIL (the access was
+ * allowed — the bound did NOT hold). A SIGPROT-handler path inside the child
+ * is also kept for boards where the signal can be caught, so we can print the
+ * faulting capability's metadata before exiting.
+ */
+
+static jmp_buf  sec_env;
+static volatile int sec_sig;
+
+static void
+sec_fault_handler(int sig)
+{
+    sec_sig = sig;
+    longjmp(sec_env, 1);
+}
+
+static void
+print_cap(const char *what, void * __capability cap)
+{
+    printf("    %s: base=0x%012lx len=%zu off=%zu perms=0x%05lx tag=%d\n",
+           what,
+           (unsigned long)cheri_getbase(cap),
+           cheri_getlen(cap),
+           cheri_getoffset(cap),
+           (unsigned long)cheri_getperm(cap),
+           (int)cheri_gettag(cap));
+}
+
+/*
+ * Each violation_fn performs ONE deliberately-illegal access. It runs in the
+ * child; if CHERI lets the longjmp handler catch the fault we return here and
+ * the child exits 0 (NO fault — a FAIL). If the access traps uncatchably the
+ * child dies on the signal, which the parent sees as a PASS.
+ */
+typedef void (*violation_fn)(sfc7120_if_t *sfc);
+
+static void
+violate_doorbell_oob(sfc7120_if_t *sfc)
+{
+    volatile uint32_t * __capability db = (volatile uint32_t * __capability)
+        sfc->mmio_slices[SFC7120_SLICE_TX_DESC_DBL].addr;
+    print_cap("TX_DESC_DBL slice", (void * __capability)db);
+    /* Slice is 12 bytes (3 dwords). Index [64] is offset 256 — far past the
+     * bound. Writing it must trap before any MMIO store happens. */
+    printf("    -> writing dword index [64] (offset 256, bound 12)\n");
+    db[64] = 0xdeadbeef;
+    printf("    -> write returned (NO TRAP)\n");
+}
+
+static void
+violate_txbuf_overflow(sfc7120_if_t *sfc)
+{
+    volatile uint8_t * __capability buf =
+        (volatile uint8_t * __capability)sfc->tx_buffer;
+    size_t cap_len = cheri_getlen((void * __capability)buf);
+    print_cap("TX buffer", (void * __capability)buf);
+    /* Buffer is 1 MB; touching byte [cap_len] is one past the end. */
+    printf("    -> writing byte index [%zu] (one past %zu-byte bound)\n",
+           cap_len, cap_len);
+    buf[cap_len] = 0xA5;
+    printf("    -> write returned (NO TRAP)\n");
+}
+
+static void
+violate_descring_oob(sfc7120_if_t *sfc)
+{
+    volatile uint64_t * __capability ring =
+        (volatile uint64_t * __capability)sfc->tx_desc_ring;
+    size_t cap_len = cheri_getlen((void * __capability)ring);
+    size_t n_desc  = cap_len / SFC7120_TX_DESC_SIZE;
+    print_cap("TX desc ring", (void * __capability)ring);
+    /* Ring holds n_desc descriptors (indices 0..n_desc-1). Writing index
+     * [n_desc] is one descriptor past the ring's capability bound. */
+    printf("    -> writing descriptor index [%zu] (bound is %zu descriptors)\n",
+           n_desc, n_desc);
+    ring[n_desc] = 0xdeadbeefcafef00dULL;
+    printf("    -> write returned (NO TRAP)\n");
+}
+
+/*
+ * run_one_violation — fork, run the violation in the child, report from the
+ * parent. Returns 1 if the bound held (PASS: child trapped), 0 otherwise.
+ */
+static int
+run_one_violation(int n, const char *desc, sfc7120_if_t *sfc, violation_fn fn)
+{
+    printf("\n[sec %d] %s\n", n, desc);
+    fflush(stdout);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("    fork");
+        return 0;
+    }
+    if (pid == 0) {
+        /* Child: try to catch the fault so we can report cap metadata, but a
+         * truly uncatchable CHERI trap will just kill us — which is the PASS
+         * signal the parent is looking for. */
+        signal(SIGPROT, sec_fault_handler);
+        signal(SIGSEGV, sec_fault_handler);
+        signal(SIGBUS,  sec_fault_handler);
+        if (setjmp(sec_env) == 0) {
+            fn(sfc);
+            /* Reached here = NO fault. The access was allowed. */
+            _exit(42);          /* sentinel: bound did NOT hold */
+        } else {
+            printf("    [child] caught signal %d (capability fault) — bound held\n",
+                   sec_sig);
+            _exit(0);           /* caught the fault: PASS */
+        }
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        int s = WTERMSIG(status);
+        printf("    PASS — child killed by signal %d (%s); hardware trapped "
+               "the access\n", s, strsignal(s));
+        return 1;
+    }
+    if (WIFEXITED(status)) {
+        int code = WEXITSTATUS(status);
+        if (code == 0) {
+            printf("    PASS — child caught the capability fault and exited "
+                   "cleanly\n");
+            return 1;
+        }
+        if (code == 42) {
+            printf("    FAIL — access was ALLOWED; the capability bound did "
+                   "NOT trap!\n");
+            return 0;
+        }
+        printf("    FAIL — child exited %d (unexpected)\n", code);
+        return 0;
+    }
+    printf("    FAIL — child neither exited nor signalled cleanly\n");
+    return 0;
+}
+
+static int
+run_security_test(void)
+{
+    sfc7120_if_t sfc = { .dev_path = DEV_PF1 };
+
+    if (sfc7120_init(&sfc) != 0) {
+        fprintf(stderr, "test: security init failed\n");
+        return 1;
+    }
+    printf("============================================================\n");
+    printf("  CAPIO Security Test — Solarflare 7120 (sfc7120pol)\n");
+    printf("  Each test commits a memory violation in a forked child;\n");
+    printf("  PASS = hardware (CHERI) trapped it.\n");
+    printf("============================================================\n");
+    dump_vi_state(&sfc);
+
+    int passes = 0, total = 3;
+    passes += run_one_violation(1,
+        "Out-of-bounds write on the TX doorbell slice capability",
+        &sfc, violate_doorbell_oob);
+    passes += run_one_violation(2,
+        "Buffer overflow one byte past the TX packet-buffer capability",
+        &sfc, violate_txbuf_overflow);
+    passes += run_one_violation(3,
+        "Index one descriptor past the TX descriptor-ring capability",
+        &sfc, violate_descring_oob);
+
+    printf("\n============================================================\n");
+    printf("  Security test result: %d/%d bounds enforced in hardware\n",
+           passes, total);
+    printf("============================================================\n");
+
+    sfc7120_destroy(&sfc);
+    return passes == total ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll\n", argv[0]);
+        fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll|sec\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "tx") == 0)
@@ -320,7 +532,9 @@ main(int argc, char **argv)
         return run_consumer_direct();
     if (strcmp(argv[1], "poll") == 0)
         return run_poller();
+    if (strcmp(argv[1], "sec") == 0)
+        return run_security_test();
 
-    fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll\n", argv[0]);
+    fprintf(stderr, "usage: %s tx|txd|rx|rxd|poll|sec\n", argv[0]);
     return 2;
 }
